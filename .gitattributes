@@ -1,0 +1,2 @@
+# Unified patches require a space prefix on blank context lines.
+docs/patches/*.patch -whitespace
