@@ -45,6 +45,7 @@ static int keyboard_modifiers;
 static const char data[1] = {0};
 static Cursor cursor;
 static bool grabbed = True;
+static bool viewonly;
 
 static int x11_handler(int fd) {
   XEvent event;
@@ -53,6 +54,9 @@ static int x11_handler(int fd) {
 
   while (XPending(display)) {
     XNextEvent(display, &event);
+    if (viewonly && event.type != ClientMessage)
+      continue;
+    button = 0;
     switch (event.type) {
     case KeyPress:
     case KeyRelease:
@@ -153,19 +157,33 @@ static int x11_handler(int fd) {
   return LOOP_OK;
 }
 
-void x11_input_init(Display* x11_display, Window x11_window) {
+void x11_input_init(Display* x11_display, Window x11_window, bool readonly) {
   display = x11_display;
   window = x11_window;
+  viewonly = readonly;
+  grabbed = !viewonly;
+  last_x = last_y = -1;
+  keyboard_modifiers = 0;
 
   wm_deletemessage = XInternAtom(display, "WM_DELETE_WINDOW", False);
   XSetWMProtocols(display, window, &wm_deletemessage, 1);
 
   /* make a blank cursor */
-  XColor dummy;
+  XColor dummy = {0};
   Pixmap blank = XCreateBitmapFromData(display, window, data, 1, 1);
   cursor = XCreatePixmapCursor(display, blank, blank, &dummy, &dummy, 0, 0);
   XFreePixmap(display, blank);
-  XDefineCursor(display, window, cursor);
+  if (!viewonly)
+    XDefineCursor(display, window, cursor);
 
   loop_add_fd(ConnectionNumber(display), x11_handler, POLLIN | POLLERR | POLLHUP);
+}
+
+void x11_input_cleanup(void) {
+  if (display) {
+    loop_remove_fd(ConnectionNumber(display));
+    if (cursor) XFreeCursor(display, cursor);
+  }
+  cursor = 0;
+  display = NULL;
 }

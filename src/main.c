@@ -83,7 +83,7 @@ static int get_app_id(PSERVER_DATA server, const char *name) {
   return -1;
 }
 
-static void stream(PSERVER_DATA server, PCONFIGURATION config, enum platform system) {
+static int stream(PSERVER_DATA server, PCONFIGURATION config, enum platform system) {
   int appId = get_app_id(server, config->app);
   if (appId<0) {
     fprintf(stderr, "Can't find app %s\n", config->app);
@@ -117,6 +117,8 @@ static void stream(PSERVER_DATA server, PCONFIGURATION config, enum platform sys
   int drFlags = 0;
   if (config->fullscreen)
     drFlags |= DISPLAY_FULLSCREEN;
+  if (config->viewonly)
+    drFlags |= DISPLAY_VIEW_ONLY;
 
   switch (config->rotate) {
   case 0:
@@ -143,7 +145,12 @@ static void stream(PSERVER_DATA server, PCONFIGURATION config, enum platform sys
     loop_init();
 
   platform_start(system);
-  LiStartConnection(&server->serverInfo, &config->stream, &connection_callbacks, platform_get_video(system), platform_get_audio(system, config->audio_device), NULL, drFlags, config->audio_device, 0);
+  ret = LiStartConnection(&server->serverInfo, &config->stream, &connection_callbacks, platform_get_video(system), platform_get_audio(system, config->audio_device), NULL, drFlags, config->audio_device, 0);
+  if (ret != 0) {
+    fprintf(stderr, "Stream initialization failed: %d\n", ret);
+    platform_stop(system);
+    return EXIT_FAILURE;
+  }
 
   if (IS_EMBEDDED(system)) {
     if (!config->viewonly)
@@ -166,6 +173,7 @@ static void stream(PSERVER_DATA server, PCONFIGURATION config, enum platform sys
   }
 
   platform_stop(system);
+  return EXIT_SUCCESS;
 }
 
 static void help() {
@@ -210,7 +218,7 @@ static void help() {
   printf("\t-surround <5.1/7.1>\t\tStream 5.1 or 7.1 surround sound\n");
   printf("\t-keydir <directory>\tLoad encryption keys from directory\n");
   printf("\t-mapping <file>\t\tUse <file> as gamepad mappings configuration file\n");
-  printf("\t-platform <system>\tSpecify system used for audio, video and input: pi/imx/aml/rk/x11/x11_vdpau/sdl/fake (default auto)\n");
+  printf("\t-platform <system>\tSpecify system used for audio, video and input: pi/imx/aml/rk/th1520/x11/x11_vdpau/sdl/fake (default auto)\n");
   printf("\t-nounsupported\t\tDon't stream if resolution is not officially supported by the server\n");
   printf("\t-quitappafter\t\tSend quit app request to remote after quitting session\n");
   printf("\t-viewonly\t\tDisable all input processing (view-only mode)\n");
@@ -319,6 +327,17 @@ int main(int argc, char* argv[]) {
       exit(-1);
     }
 
+    #ifdef HAVE_TH1520
+    if (system == TH1520 && config.codec == CODEC_AV1) {
+      fprintf(stderr, "AV1 is not supported by the TH1520 OpenMAX IL backend\n");
+      exit(-1);
+    }
+    if (system == TH1520 && config.hdr) {
+      fprintf(stderr, "HDR and 10-bit video are not supported by the TH1520 OpenMAX IL backend\n");
+      exit(-1);
+    }
+    #endif
+
     config.stream.supportedVideoFormats = VIDEO_FORMAT_H264;
     if (config.codec == CODEC_HEVC || (config.codec == CODEC_UNSPECIFIED && platform_prefers_codec(system, CODEC_HEVC))) {
       config.stream.supportedVideoFormats |= VIDEO_FORMAT_H265;
@@ -392,7 +411,7 @@ int main(int argc, char* argv[]) {
       #endif
     }
 
-    stream(&server, &config, system);
+    return stream(&server, &config, system);
   } else if (strcmp("pair", config.action) == 0) {
     char pin[5];
     if (config.pin > 0 && config.pin <= 9999) {

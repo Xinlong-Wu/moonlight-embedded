@@ -18,5 +18,7 @@
  */
 
 #include <X11/Xlib.h>
+#include <stdbool.h>
 
-void x11_input_init(Display* display, Window window);
+void x11_input_init(Display* display, Window window, bool viewonly);
+void x11_input_cleanup(void);
