@@ -16,6 +16,8 @@ aux_source_directory(../third_party/moonlight-common-c/src MOONLIGHT_COMMON_SRC_
 aux_source_directory(../third_party/moonlight-common-c/reedsolomon MOONLIGHT_COMMON_SRC_LIST)
 
 add_library(moonlight-common SHARED ${MOONLIGHT_COMMON_SRC_LIST})
+# PlatformCrypto belongs to moonlight-common, including for standalone clients.
+target_link_libraries(moonlight-common PRIVATE OpenSSL::Crypto Threads::Threads ${CMAKE_DL_LIBS})
 
 add_library(gamestream SHARED ${GAMESTREAM_SRC_LIST})
 target_link_libraries(gamestream moonlight-common)

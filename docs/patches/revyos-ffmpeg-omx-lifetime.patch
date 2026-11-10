@@ -1,0 +1,112 @@
+diff --git a/libavcodec/omxdecoder.c b/libavcodec/omxdecoder.c
+index f404529..787e116 100644
+--- a/libavcodec/omxdecoder.c
++++ b/libavcodec/omxdecoder.c
+@@ -401,6 +401,9 @@ typedef struct {
+ typedef struct {
+     OMXCodecDecoderContext *s;
+     AVBufferRef *decoder_ref;
++#ifdef DRM_PRIME
++    AVDRMFrameDescriptor *desc;
++#endif
+ } OMXFrameContext;
+ 
+ static uint8_t *find_save_vir_address(OMXCodecDecoderContext *s, OMX_BUFFERHEADERTYPE *buffer, int size, bool with_save)
+@@ -1057,6 +1060,9 @@ static void omx_release_frame(void *opaque, uint8_t *data)
+     OMXFrameContext *framecontext = (OMXFrameContext *)framecontextref->data;
+ 
+     omx_try_fillbuffer(framecontext->s, (OMX_BUFFERHEADERTYPE *)data);
++#ifdef DRM_PRIME
++    av_freep(&framecontext->desc);
++#endif
+ 
+     av_buffer_unref(&framecontext->decoder_ref);
+     av_buffer_unref(&framecontextref);
+@@ -1157,17 +1163,16 @@ static int copyNV12toDst(AVCodecContext *avctx, AVFrame *avframe, OMX_BUFFERHEAD
+                 ret = AVERROR(ENOMEM);
+                 return ret;
+             }
++            hwframes = (AVHWFramesContext *)s->frames_ref->data;
++            hwframes->format    = AV_PIX_FMT_DRM_PRIME;
++            hwframes->sw_format = AV_PIX_FMT_NV12;
++            hwframes->width     = avctx->width;
++            hwframes->height    = avctx->height;
++            ret = av_hwframe_ctx_init(s->frames_ref);
++            if (ret < 0)
++                return ret;
+         }
+ 
+-        hwframes = (AVHWFramesContext *)s->frames_ref->data;
+-        hwframes->format    = AV_PIX_FMT_DRM_PRIME;
+-        hwframes->sw_format = AV_PIX_FMT_NV12;
+-        hwframes->width     = avctx->width;
+-        hwframes->height    = avctx->height;
+-        ret = av_hwframe_ctx_init(s->frames_ref);
+-        if (ret < 0)
+-            return ret;
+-
+         avframe->hw_frames_ctx = av_buffer_ref(s->frames_ref);
+         if (!avframe->hw_frames_ctx) {
+             ret = AVERROR(ENOMEM);
+@@ -1194,8 +1199,11 @@ static int copyNV12toDst(AVCodecContext *avctx, AVFrame *avframe, OMX_BUFFERHEAD
+     if (!s->resolution_changed || s->drm_prime_mode) {
+ #ifdef DRM_PRIME
+         if (s->drm_prime_mode) {
+-            av_freep(&avframe->data);
+-            av_freep(&avframe->buf);
++            // ff_get_buffer() returned AVBufferRefs: release references, not
++            // the raw allocation and AVBufferRef structs independently.
++            for (int i = 0; i < AV_NUM_DATA_POINTERS; i++)
++                av_buffer_unref(&avframe->buf[i]);
++            memset(avframe->data, 0, sizeof(avframe->data));
+             avframe->format = AV_PIX_FMT_DRM_PRIME;
+             avframe->data[0]  = (uint8_t *)s->desc;
+             avframe->opaque = buffer;
+@@ -1207,10 +1215,21 @@ static int copyNV12toDst(AVCodecContext *avctx, AVFrame *avframe, OMX_BUFFERHEAD
+                                                sizeof(OMX_BUFFERHEADERTYPE),
+                                                omx_release_frame,
+                                                framecontextref, AV_BUFFER_FLAG_READONLY);
++            if (!avframe->buf[0]) {
++                OMXFrameContext *fc = (OMXFrameContext *)framecontextref->data;
++                av_buffer_unref(&fc->decoder_ref);
++                av_buffer_unref(&framecontextref);
++                return AVERROR(ENOMEM);
++            }
++            ((OMXFrameContext *)framecontextref->data)->desc = s->desc;
++            s->desc = NULL;
+             buffer->pAppPrivate = avframe;
+         } else {
+-            av_freep(&avframe->data);
+-            av_freep(&avframe->buf);
++            // ff_get_buffer() returned AVBufferRefs: release references, not
++            // the raw allocation and AVBufferRef structs independently.
++            for (int i = 0; i < AV_NUM_DATA_POINTERS; i++)
++                av_buffer_unref(&avframe->buf[i]);
++            memset(avframe->data, 0, sizeof(avframe->data));
+             avframe->data[0] = y_src;
+             avframe->data[1] = uv_src;
+             avframe->opaque = buffer;
+@@ -1327,6 +1346,7 @@ static int omx_try_fillbuffer(OMXCodecDecoderContext *s, OMX_BUFFERHEADERTYPE *b
+         if (err != OMX_ErrorNone) {
+             append_buffer(&s->output_mutex, &s->output_cond, &s->num_done_out_buffers, s->done_out_buffers, buffer);
+             av_log(NULL, AV_LOG_ERROR, "OMX_FillThisBuffer failed: %x\n", err);
++            pthread_mutex_unlock(&s->free_mutex);
+             return err;
+         }
+         buffer->pAppPrivate = NULL;
+@@ -1746,6 +1766,7 @@ static av_cold void omx_cleanup(OMXCodecDecoderContext *s)
+             free(s->desc);
+             s->desc = NULL;
+         }
++        av_buffer_unref(&s->frames_ref);
+         av_buffer_unref(&s->device_ref);
+     }
+ #endif
+@@ -2221,6 +2242,7 @@ static const AVOption ff_omxcodec_vdec_options[] = {
+     { "output_height", "output height(must smaller than the original height)",  OFFSET(output_height), AV_OPT_TYPE_INT,       {.i64 = 0}, 0, 0xFFFFFFFF, VD},
+ #ifdef DRM_PRIME
+     { "drm_prime",     "output avframe format(true: DRM_PRIME, false: NV12)",   OFFSET(drm_prime_mode), AV_OPT_TYPE_BOOL,     {.i64 = 0}, 0, 1, VD},
++    { "th1520_drm_lifetime_fixed", "DRM descriptors and frame contexts have bounded lifetimes", 0, AV_OPT_TYPE_CONST, {.i64 = 1}, 0, 0, VD, "th1520_fixes" },
+ #endif
+     { NULL }
+ };

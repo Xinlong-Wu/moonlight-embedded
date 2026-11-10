@@ -28,6 +28,7 @@
 #define DISPLAY_ROTATE_90 8
 #define DISPLAY_ROTATE_180 16
 #define DISPLAY_ROTATE_270 24
+#define DISPLAY_VIEW_ONLY 32
 
 #define INIT_EGL 1
 #define INIT_VDPAU 2
@@ -38,6 +39,9 @@
 #ifdef HAVE_X11
 int x11_init(bool vdpau, bool vaapi);
 extern DECODER_RENDERER_CALLBACKS decoder_callbacks_x11;
+#ifdef HAVE_TH1520
+extern DECODER_RENDERER_CALLBACKS decoder_callbacks_x11_th1520;
+#endif
 #ifdef HAVE_VAAPI
 extern DECODER_RENDERER_CALLBACKS decoder_callbacks_x11_vaapi;
 #endif

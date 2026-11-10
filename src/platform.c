@@ -31,6 +31,10 @@
 #include <unistd.h>
 #include <dlfcn.h>
 
+#ifdef HAVE_TH1520
+#include <libavcodec/avcodec.h>
+#endif
+
 typedef bool(*ImxInit)();
 
 enum platform platform_check(char* name) {
@@ -73,12 +77,26 @@ enum platform platform_check(char* name) {
       return RK;
   }
   #endif
+  #ifdef HAVE_TH1520
+  if (std || strcmp(name, "th1520") == 0) {
+    if (access("/dev/hantrodec", R_OK | W_OK) == 0 &&
+        access("/dev/vc8000", R_OK | W_OK) == 0 &&
+        access("/dev/vidmem", R_OK | W_OK) == 0 &&
+        avcodec_find_decoder_by_name("h264_omx") != NULL &&
+        avcodec_find_decoder_by_name("hevc_omx") != NULL &&
+        x11_init(false, false) == INIT_EGL)
+      return TH1520;
+    if (!std)
+      fprintf(stderr, "TH1520 requires accessible hantrodec/vc8000/vidmem devices, RevyOS OMX FFmpeg decoders, and an authorized X11 DISPLAY.\n");
+  }
+  #endif
   #ifdef HAVE_X11
   bool x11 = strcmp(name, "x11") == 0;
   bool vdpau = strcmp(name, "x11_vdpau") == 0;
   bool vaapi = strcmp(name, "x11_vaapi") == 0;
   if (std || x11 || vdpau || vaapi) {
     int init = x11_init(std || vdpau, std || vaapi);
+    (void)init;
     #ifdef HAVE_VAAPI
     if (init == INIT_VAAPI)
       return X11_VAAPI;
@@ -176,6 +194,10 @@ DECODER_RENDERER_CALLBACKS* platform_get_video(enum platform system) {
   case RK:
     return (PDECODER_RENDERER_CALLBACKS) dlsym(RTLD_DEFAULT, "decoder_callbacks_rk");
   #endif
+  #ifdef HAVE_TH1520
+  case TH1520:
+    return &decoder_callbacks_x11_th1520;
+  #endif
   }
   return NULL;
 }
@@ -218,6 +240,7 @@ bool platform_prefers_codec(enum platform system, enum codecs codec) {
     switch (system) {
     case AML:
     case RK:
+    case TH1520:
     case X11_VAAPI:
     case X11_VDPAU:
       return true;
@@ -241,6 +264,8 @@ char* platform_name(enum platform system) {
     return "AMLogic VPU";
   case RK:
     return "Rockchip VPU";
+  case TH1520:
+    return "TH1520 VPU (OpenMAX IL)";
   case X11:
     return "X Window System (software decoding)";
   case X11_VAAPI:

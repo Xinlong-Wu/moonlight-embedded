@@ -138,7 +138,10 @@ By default the gamecontrollerdb.txt provided by Moonlight Embedded is used.
 =item B<-platform> [I<PLATFORM>]
 
 Select platform for audio and video output and input.
-<PLATFORM> can be pi, imx, aml, x11, x11_vdpau, sdl or fake.
+<PLATFORM> can be pi, imx, aml, rk, th1520, x11, x11_vdpau, sdl or fake.
+The th1520 platform uses RevyOS FFmpeg OpenMAX IL decoders and the TH1520 VPU.
+It supports 8-bit H.264 and HEVC SDR streaming in an X11 window or fullscreen.
+AV1, 10-bit video and HDR are not supported by this backend.
 
 =item B<-nounsupported>
 
