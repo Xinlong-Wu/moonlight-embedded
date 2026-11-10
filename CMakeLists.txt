@@ -62,9 +62,10 @@ endif()
 set(VDPAU_ACCEL_FOUND FALSE)
 set(VA_ACCEL_FOUND FALSE)
 set(SOFTWARE_FOUND FALSE)
+set(X11_FOUND FALSE)
 
-if(AVCODEC_FOUND AND AVUTIL_FOUND)
-  if(EGL_FOUND AND GLES_FOUND AND XLIB_FOUND)
+if(ENABLE_FFMPEG AND AVCODEC_FOUND AND AVUTIL_FOUND)
+  if(ENABLE_X11 AND EGL_FOUND AND GLES_FOUND AND XLIB_FOUND)
     set(X11_FOUND TRUE)
     if(VDPAU_FOUND)
       set(VDPAU_ACCEL_FOUND TRUE)
@@ -101,7 +102,9 @@ if (HAVE_GETAUXVAL)
 endif()
 
 check_c_source_compiles("int main(void) { return __builtin_cpu_supports(\"aes\"); }" HAVE_BICS_AES)
-if (HAVE_BICS_AES)
+# Some Clang RISC-V builds accept the builtin but only warn that the x86 AES
+# feature string is invalid. Do not enable the x86 runtime probe on this board.
+if (HAVE_BICS_AES AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|i.86)$")
   list(APPEND MOONLIGHT_DEFINITIONS HAVE_BICS_AES)
 endif()
 
