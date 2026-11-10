@@ -73,19 +73,13 @@ void loop_add_fd(int fd, FdHandler handler, int events) {
 }
 
 void loop_remove_fd(int fd) {
-  numFds--;
-  int fdindex = numFds;
-
-  for (int i=0;i<=numFds;i++) {
+  for (int i = 0; i < numFds; i++) {
     if (fds[i].fd == fd) {
-      fdindex = i;
-      break;
+      numFds--;
+      fds[i] = fds[numFds];
+      fdHandlers[i] = fdHandlers[numFds];
+      return;
     }
-  }
-
-  if (fdindex != numFds && numFds > 0) {
-    memcpy(&fds[fdindex], &fds[numFds], sizeof(struct pollfd));
-    memcpy(&fdHandlers[fdindex], &fdHandlers[numFds], sizeof(FdHandler));
   }
 }
 
