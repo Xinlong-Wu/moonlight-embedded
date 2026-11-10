@@ -25,11 +25,14 @@
 
 #include <Limelight.h>
 #include <libavcodec/avcodec.h>
+#include <libavutil/opt.h>
 
 #include <stdlib.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <string.h>
+#include <errno.h>
 
 // General decoder and renderer state
 static AVPacket* pkt;
@@ -39,53 +42,185 @@ static AVFrame** dec_frames;
 
 static int dec_frames_cnt;
 static int current_frame, next_frame;
+static bool packet_pending;
+
+// Parse compressed TH1520 input independently of the OMX component. The vendor
+// wrapper may return/reallocate output buffers as soon as it sees a changed SPS,
+// so a post-decode dimension check is too late to protect displayed frames.
+static AVCodecParserContext* th1520_parser;
+static AVCodecContext* th1520_parser_ctx;
+static enum AVCodecID th1520_parser_codec = AV_CODEC_ID_NONE;
+static int th1520_expected_width, th1520_expected_height;
+static int th1520_coded_width, th1520_coded_height;
+static int th1520_parser_error;
 
 enum decoders ffmpeg_decoder;
 
 #define BYTES_PER_PIXEL 4
 
+static void log_av_error(const char* operation, int err) {
+  char errorstring[512];
+  av_strerror(err, errorstring, sizeof(errorstring));
+  fprintf(stderr, "%s - %d/%s\n", operation, err, errorstring);
+}
+
+static int th1520_reset_parser(void) {
+  if (th1520_parser) av_parser_close(th1520_parser);
+  th1520_parser = NULL;
+  avcodec_free_context(&th1520_parser_ctx);
+  th1520_parser = av_parser_init(th1520_parser_codec);
+  th1520_parser_ctx = avcodec_alloc_context3(NULL);
+  if (!th1520_parser || !th1520_parser_ctx) {
+    fprintf(stderr, "TH1520: cannot allocate independent H.264/HEVC size parser\n");
+    return AVERROR(ENOMEM);
+  }
+  th1520_parser->flags |= PARSER_FLAG_COMPLETE_FRAMES;
+  th1520_parser_ctx->codec_type = AVMEDIA_TYPE_VIDEO;
+  th1520_parser_ctx->codec_id = th1520_parser_codec;
+  return 0;
+}
+
+// A new parameter set must not be validated using a stale size from the old
+// parser state: FFmpeg parsers can log a malformed SPS but return success.
+static bool th1520_has_parameter_set(const uint8_t* data, int size) {
+  for (int i = 0; i + 3 < size; i++) {
+    if (data[i] || data[i + 1]) continue;
+    int header;
+    if (data[i + 2] == 1) header = i + 3;
+    else if (data[i + 2] == 0 && i + 4 < size && data[i + 3] == 1) header = i + 4;
+    else continue;
+    if (th1520_parser_codec == AV_CODEC_ID_H264) {
+      unsigned type = data[header] & 0x1f;
+      if (type == 7 || type == 8) return true;
+    } else {
+      unsigned type = (data[header] >> 1) & 0x3f;
+      if (type == 32 || type == 33 || type == 34) return true;
+    }
+    i = header - 1;
+  }
+  return false;
+}
+
+static int th1520_validate_size(const uint8_t* data, int size) {
+  if (th1520_parser_error) return th1520_parser_error;
+  if (!th1520_parser || !th1520_parser_ctx) return AVERROR(EINVAL);
+  // Moonlight supplies complete parameter sets with IDR access units. Reject
+  // partial/malformed configuration rather than trusting dimensions retained
+  // from an earlier SPS. This deliberately favors safety over partial-config
+  // streams that require combining old and new parameter sets.
+  if (th1520_has_parameter_set(data, size)) {
+    int err = th1520_reset_parser();
+    if (err < 0) return th1520_parser_error = err;
+  }
+  uint8_t* output = NULL;
+  int output_size = 0;
+  int consumed = av_parser_parse2(th1520_parser, th1520_parser_ctx, &output,
+                                  &output_size, data, size, AV_NOPTS_VALUE,
+                                  AV_NOPTS_VALUE, 0);
+  if (consumed < 0 || consumed != size || output_size != size ||
+      th1520_parser->width <= 0 || th1520_parser->height <= 0 ||
+      th1520_parser->coded_width < th1520_parser->width ||
+      th1520_parser->coded_height < th1520_parser->height) {
+    fprintf(stderr, "TH1520: cannot validate complete AU dimensions; refusing compressed input to fixed-size OMX component\n");
+    return th1520_parser_error = AVERROR_INVALIDDATA;
+  }
+  // Compare visible dimensions, not macroblock-aligned coded dimensions:
+  // 1366x768 is valid even when H.264 reports coded_width == 1376.
+  if (th1520_parser->width != th1520_expected_width ||
+      th1520_parser->height != th1520_expected_height ||
+      (th1520_coded_width && th1520_parser->coded_width != th1520_coded_width) ||
+      (th1520_coded_height && th1520_parser->coded_height != th1520_coded_height)) {
+    fprintf(stderr, "TH1520: fixed-size OMX setup %dx%d does not support AU %dx%d (coded %dx%d); resolution changes are unsupported\n",
+            th1520_expected_width, th1520_expected_height,
+            th1520_parser->width, th1520_parser->height,
+            th1520_parser->coded_width, th1520_parser->coded_height);
+    return th1520_parser_error = AVERROR_INPUT_CHANGED;
+  }
+  th1520_coded_width = th1520_parser->coded_width;
+  th1520_coded_height = th1520_parser->coded_height;
+  return 0;
+}
+
 // This function must be called before
 // any other decoding functions
 int ffmpeg_init(int videoFormat, int width, int height, int perf_lvl, int buffer_count, int thread_count) {
+  // Also clean up a partially initialized or previously used decoder.
+  ffmpeg_destroy();
+
+  // Keep vendor OMX initialization and device errors visible. Other backends
+  // retain their historical quiet logging setting.
+  av_log_set_level((perf_lvl & TH1520_ACCELERATION) ? AV_LOG_INFO : AV_LOG_QUIET);
+
   // Initialize the avcodec library and register codecs
-  av_log_set_level(AV_LOG_QUIET);
 #if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(58,10,100)
   avcodec_register_all();
 #endif
 
-  pkt = av_packet_alloc();
-  if (pkt == NULL) {
-    printf("Couldn't allocate packet\n");
+  if (buffer_count <= 0 || width <= 0 || height <= 0) {
+    fprintf(stderr, "Invalid decoder dimensions or frame buffer count\n");
     return -1;
   }
 
-  ffmpeg_decoder = perf_lvl & VAAPI_ACCELERATION ? VAAPI : SOFTWARE;
+  ffmpeg_decoder = (perf_lvl & TH1520_ACCELERATION) ? TH1520_OMX :
+                   (perf_lvl & VAAPI_ACCELERATION) ? VAAPI : SOFTWARE;
 
-  for (int try = 0; try < 6; try++) {
+  if (ffmpeg_decoder == TH1520_OMX && videoFormat != VIDEO_FORMAT_H264 && videoFormat != VIDEO_FORMAT_H265) {
+    fprintf(stderr, "TH1520 OMX decoding only supports 8-bit 4:2:0 H.264 and HEVC\n");
+    return -1;
+  }
+
+  if (ffmpeg_decoder == TH1520_OMX) {
+    th1520_expected_width = width;
+    th1520_expected_height = height;
+    th1520_parser_codec = videoFormat == VIDEO_FORMAT_H264 ? AV_CODEC_ID_H264 : AV_CODEC_ID_HEVC;
+    if (th1520_reset_parser() < 0) goto fail;
+  }
+
+  pkt = av_packet_alloc();
+  if (pkt == NULL) {
+    printf("Couldn't allocate packet\n");
+    goto fail;
+  }
+
+  int max_tries = ffmpeg_decoder == TH1520_OMX ? 1 : 6;
+  for (int try = 0; try < max_tries; try++) {
+    // Never let a failed attempt leave a stale decoder selection behind.
+    decoder = NULL;
+
     if (videoFormat & VIDEO_FORMAT_MASK_H264) {
-      if (ffmpeg_decoder == SOFTWARE) {
-        if (try == 0) decoder = avcodec_find_decoder_by_name("h264_nvv4l2"); // Tegra
-        if (try == 1) decoder = avcodec_find_decoder_by_name("h264_nvmpi"); // Tegra
-        if (try == 2) decoder = avcodec_find_decoder_by_name("h264_omx"); // VisionFive
-        if (try == 3) decoder = avcodec_find_decoder_by_name("h264_v4l2m2m"); // Stateful V4L2
+      if (ffmpeg_decoder == TH1520_OMX) {
+        if (try == 0) decoder = avcodec_find_decoder_by_name("h264_omx");
+      } else {
+        if (ffmpeg_decoder == SOFTWARE) {
+          if (try == 0) decoder = avcodec_find_decoder_by_name("h264_nvv4l2"); // Tegra
+          if (try == 1) decoder = avcodec_find_decoder_by_name("h264_nvmpi"); // Tegra
+          if (try == 2) decoder = avcodec_find_decoder_by_name("h264_omx"); // VisionFive
+          if (try == 3) decoder = avcodec_find_decoder_by_name("h264_v4l2m2m"); // Stateful V4L2
+        }
+        if (try == 4) decoder = avcodec_find_decoder_by_name("h264"); // Software and hwaccel
       }
-      if (try == 4) decoder = avcodec_find_decoder_by_name("h264"); // Software and hwaccel
     } else if (videoFormat & VIDEO_FORMAT_MASK_H265) {
-      if (ffmpeg_decoder == SOFTWARE) {
-        if (try == 0) decoder = avcodec_find_decoder_by_name("hevc_nvv4l2"); // Tegra
-        if (try == 1) decoder = avcodec_find_decoder_by_name("hevc_nvmpi"); // Tegra
-        if (try == 2) decoder = avcodec_find_decoder_by_name("hevc_omx"); // VisionFive
-        if (try == 3) decoder = avcodec_find_decoder_by_name("hevc_v4l2m2m"); // Stateful V4L2
+      if (ffmpeg_decoder == TH1520_OMX) {
+        if (try == 0) decoder = avcodec_find_decoder_by_name("hevc_omx");
+      } else {
+        if (ffmpeg_decoder == SOFTWARE) {
+          if (try == 0) decoder = avcodec_find_decoder_by_name("hevc_nvv4l2"); // Tegra
+          if (try == 1) decoder = avcodec_find_decoder_by_name("hevc_nvmpi"); // Tegra
+          if (try == 2) decoder = avcodec_find_decoder_by_name("hevc_omx"); // VisionFive
+          if (try == 3) decoder = avcodec_find_decoder_by_name("hevc_v4l2m2m"); // Stateful V4L2
+        }
+        if (try == 4) decoder = avcodec_find_decoder_by_name("hevc"); // Software and hwaccel
       }
-      if (try == 4) decoder = avcodec_find_decoder_by_name("hevc"); // Software and hwaccel
     } else if (videoFormat & VIDEO_FORMAT_MASK_AV1) {
-      if (ffmpeg_decoder == SOFTWARE) {
-        if (try == 0) decoder = avcodec_find_decoder_by_name("libdav1d");
+      if (ffmpeg_decoder != TH1520_OMX) {
+        if (ffmpeg_decoder == SOFTWARE) {
+          if (try == 0) decoder = avcodec_find_decoder_by_name("libdav1d");
+        }
+        if (try == 1) decoder = avcodec_find_decoder_by_name("av1"); // Hwaccel
       }
-      if (try == 1) decoder = avcodec_find_decoder_by_name("av1"); // Hwaccel
     } else {
       printf("Video format not supported\n");
-      return -1;
+      goto fail;
     }
 
     // Skip this decoder if it isn't compiled into FFmpeg
@@ -93,10 +228,18 @@ int ffmpeg_init(int videoFormat, int width, int height, int perf_lvl, int buffer
       continue;
     }
 
+    // SDL and the generic EGL renderer consume planar YUV420. Do not select
+    // a vendor wrapper that explicitly advertises only NV12/DRM PRIME there.
+    if (ffmpeg_decoder == SOFTWARE && decoder->pix_fmts != NULL) {
+      const enum AVPixelFormat* format = decoder->pix_fmts;
+      while (*format != AV_PIX_FMT_NONE && *format != AV_PIX_FMT_YUV420P) format++;
+      if (*format == AV_PIX_FMT_NONE) { decoder = NULL; continue; }
+    }
+
     decoder_ctx = avcodec_alloc_context3(decoder);
     if (decoder_ctx == NULL) {
       printf("Couldn't allocate context\n");
-      return -1;
+      goto fail;
     }
 
     // Use low delay decoding
@@ -109,7 +252,9 @@ int ffmpeg_init(int videoFormat, int width, int height, int perf_lvl, int buffer
     // Report decoding errors to allow us to request a key frame
     decoder_ctx->err_recognition = AV_EF_EXPLODE;
 
-    if (perf_lvl & SLICE_THREADING) {
+    if (ffmpeg_decoder == TH1520_OMX) {
+      decoder_ctx->thread_count = 1;
+    } else if (perf_lvl & SLICE_THREADING) {
       decoder_ctx->thread_type = FF_THREAD_SLICE;
       decoder_ctx->thread_count = thread_count;
     } else {
@@ -120,33 +265,73 @@ int ffmpeg_init(int videoFormat, int width, int height, int perf_lvl, int buffer
     decoder_ctx->height = height;
     decoder_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
 
-    int err = avcodec_open2(decoder_ctx, decoder, NULL);
+    AVDictionary* decoder_options = NULL;
+    if (ffmpeg_decoder == TH1520_OMX) {
+      bool nv12 = (perf_lvl & TH1520_NV12) != 0;
+      // Upstream and other vendors also expose codecs named *_omx. Only the
+      // RevyOS wrapper has the output-mode option required by this backend.
+      if (decoder_ctx->priv_data == NULL ||
+          av_opt_find(decoder_ctx->priv_data, "drm_prime", NULL,
+                      AV_OPT_FLAG_DECODING_PARAM, 0) == NULL) {
+        fprintf(stderr, "TH1520 requires the RevyOS %s decoder with the drm_prime option\n", decoder->name);
+        goto fail;
+      }
+      if (!nv12 && av_opt_find(decoder_ctx->priv_data, "th1520_drm_lifetime_fixed", "th1520_fixes",
+                              AV_OPT_FLAG_DECODING_PARAM, 0) == NULL) {
+        const char* mode = getenv("MOONLIGHT_TH1520_OUTPUT");
+        if (mode && strcmp(mode, "drm") == 0) {
+          fprintf(stderr, "TH1520: WARNING: forced DRM output on an unverified FFmpeg; RevyOS 5.1.4 has per-frame lifetime leaks. See docs/TH1520.md.\n");
+        } else {
+          fprintf(stderr, "TH1520: selecting hardware NV12 output: FFmpeg DRM lifetime fix is not detected.\n");
+          nv12 = true;
+          perf_lvl |= TH1520_NV12;
+        }
+      }
+      decoder_ctx->pix_fmt = nv12 ? AV_PIX_FMT_NV12 : AV_PIX_FMT_DRM_PRIME;
+      if (av_dict_set(&decoder_options, "drm_prime", nv12 ? "0" : "1", 0) < 0) {
+        fprintf(stderr, "Couldn't allocate TH1520 decoder options\n");
+        av_dict_free(&decoder_options);
+        goto fail;
+      }
+    }
+
+    int err = avcodec_open2(decoder_ctx, decoder, &decoder_options);
+    bool unused_output_mode = ffmpeg_decoder == TH1520_OMX &&
+                              av_dict_get(decoder_options, "drm_prime", NULL, 0) != NULL;
+    av_dict_free(&decoder_options);
     if (err < 0) {
-      printf("Couldn't open codec: %s\n", decoder->name);
+      fprintf(stderr, "Couldn't open codec: %s\n", decoder->name);
+      log_av_error("Codec initialization failed", err);
       avcodec_free_context(&decoder_ctx);
+      decoder = NULL;
       continue;
     }
+    if (unused_output_mode) {
+      fprintf(stderr, "TH1520 decoder %s did not consume the drm_prime option\n", decoder->name);
+      goto fail;
+    }
+
+    // The selected context and decoder must remain paired.
+    break;
   }
 
-  if (decoder == NULL) {
-    printf("Couldn't find decoder\n");
-    return -1;
+  if (decoder == NULL || decoder_ctx == NULL) {
+    printf("Couldn't find or open a supported decoder\n");
+    goto fail;
   }
-
-  printf("Using FFmpeg decoder: %s\n", decoder->name);
 
   dec_frames_cnt = buffer_count;
-  dec_frames = malloc(buffer_count * sizeof(AVFrame*));
+  dec_frames = calloc(buffer_count, sizeof(AVFrame*));
   if (dec_frames == NULL) {
-    fprintf(stderr, "Couldn't allocate frames");
-    return -1;
+    fprintf(stderr, "Couldn't allocate frames\n");
+    goto fail;
   }
 
   for (int i = 0; i < buffer_count; i++) {
     dec_frames[i] = av_frame_alloc();
     if (dec_frames[i] == NULL) {
-      fprintf(stderr, "Couldn't allocate frame");
-      return -1;
+      fprintf(stderr, "Couldn't allocate frame\n");
+      goto fail;
     }
   }
 
@@ -155,54 +340,201 @@ int ffmpeg_init(int videoFormat, int width, int height, int perf_lvl, int buffer
     vaapi_init(decoder_ctx);
   #endif
 
+  printf("Using FFmpeg decoder: %s\n", decoder->name);
+  if (ffmpeg_decoder == TH1520_OMX)
+    printf("TH1520 OMX output: %s\n", (perf_lvl & TH1520_NV12) ? "NV12" : "DRM PRIME");
   return 0;
+
+fail:
+  ffmpeg_destroy();
+  return -1;
 }
 
 // This function must be called after
 // decoding is finished
 void ffmpeg_destroy(void) {
   av_packet_free(&pkt);
-  if (decoder_ctx) {
-    avcodec_free_context(&decoder_ctx);
-  }
+  packet_pending = false;
+  if (th1520_parser) av_parser_close(th1520_parser);
+  th1520_parser = NULL;
+  avcodec_free_context(&th1520_parser_ctx);
+  th1520_parser_codec = AV_CODEC_ID_NONE;
+  th1520_expected_width = th1520_expected_height = 0;
+  th1520_coded_width = th1520_coded_height = 0;
+  th1520_parser_error = 0;
+
+  // OMX frames own output buffers and decoder references. Return every local
+  // frame before closing the context; the renderer must first release any
+  // clones/EGL images it owns, too.
   if (dec_frames) {
-    for (int i = 0; i < dec_frames_cnt; i++) {
-      if (dec_frames[i])
-        av_frame_free(&dec_frames[i]);
-    }
+    for (int i = 0; i < dec_frames_cnt; i++)
+      av_frame_free(&dec_frames[i]);
+    free(dec_frames);
+    dec_frames = NULL;
   }
+  avcodec_free_context(&decoder_ctx);
+  decoder = NULL;
+  dec_frames_cnt = 0;
+  current_frame = 0;
+  next_frame = 0;
+}
+
+// A few legacy wrappers don't advertise their formats until the first frame.
+// The generic SDL/EGL renderers require three planar 8-bit channels. Normalize
+// semiplanar output here rather than handing them a NULL chroma-plane pointer.
+// The TH1520 path bypasses this CPU conversion entirely.
+static int normalize_software_frame(AVFrame* frame) {
+  if (frame->format == AV_PIX_FMT_YUV420P || frame->format == AV_PIX_FMT_YUVJ420P)
+    return 0;
+  if (frame->format != AV_PIX_FMT_NV12 && frame->format != AV_PIX_FMT_NV21) {
+    fprintf(stderr, "Generic renderer cannot display FFmpeg pixel format %d\n", frame->format);
+    return AVERROR(ENOSYS);
+  }
+  int chroma_width = (frame->width + 1) / 2, chroma_height = (frame->height + 1) / 2;
+  if (!frame->data[0] || !frame->data[1] ||
+      llabs((long long)frame->linesize[0]) < frame->width ||
+      llabs((long long)frame->linesize[1]) < chroma_width * 2)
+    return AVERROR_INVALIDDATA;
+  AVFrame* planar = av_frame_alloc();
+  if (!planar) return AVERROR(ENOMEM);
+  planar->format = AV_PIX_FMT_YUV420P;
+  planar->width = frame->width; planar->height = frame->height;
+  int result = av_frame_get_buffer(planar, 32);
+  if (result >= 0) result = av_frame_copy_props(planar, frame);
+  if (result >= 0) {
+    for (int y = 0; y < frame->height; y++)
+      memcpy(planar->data[0] + (ptrdiff_t)y * planar->linesize[0],
+             frame->data[0] + (ptrdiff_t)y * frame->linesize[0], frame->width);
+    int u = frame->format == AV_PIX_FMT_NV12 ? 0 : 1;
+    for (int y = 0; y < chroma_height; y++) {
+      const unsigned char* row = frame->data[1] + (ptrdiff_t)y * frame->linesize[1];
+      for (int x = 0; x < chroma_width; x++) {
+        planar->data[1][(ptrdiff_t)y * planar->linesize[1] + x] = row[2 * x + u];
+        planar->data[2][(ptrdiff_t)y * planar->linesize[2] + x] = row[2 * x + 1 - u];
+      }
+    }
+    av_frame_unref(frame);
+    av_frame_move_ref(frame, planar);
+  }
+  av_frame_free(&planar);
+  return result;
+}
+
+static int receive_frame(bool native_frame, AVFrame** out_frame) {
+  *out_frame = NULL;
+
+  if (decoder_ctx == NULL || dec_frames == NULL)
+    return AVERROR(EINVAL);
+
+  int err = avcodec_receive_frame(decoder_ctx, dec_frames[next_frame]);
+  if (err == 0 && ffmpeg_decoder == SOFTWARE) {
+    err = normalize_software_frame(dec_frames[next_frame]);
+    if (err < 0) av_frame_unref(dec_frames[next_frame]);
+  }
+  if (err == 0) {
+    current_frame = next_frame;
+    next_frame = (current_frame + 1) % dec_frames_cnt;
+
+    if (ffmpeg_decoder == SOFTWARE || native_frame)
+      *out_frame = dec_frames[current_frame];
+  } else if (err != AVERROR(EAGAIN) && err != AVERROR_EOF) {
+    log_av_error("Receive failed", err);
+  }
+  return err;
 }
 
 AVFrame* ffmpeg_get_frame(bool native_frame) {
-  int err = avcodec_receive_frame(decoder_ctx, dec_frames[next_frame]);
-  if (err == 0) {
-    current_frame = next_frame;
-    next_frame = (current_frame+1) % dec_frames_cnt;
-
-    if (ffmpeg_decoder == SOFTWARE || native_frame)
-      return dec_frames[current_frame];
-  } else if (err != AVERROR(EAGAIN)) {
-    char errorstring[512];
-    av_strerror(err, errorstring, sizeof(errorstring));
-    fprintf(stderr, "Receive failed - %d/%s\n", err, errorstring);
-  }
-  return NULL;
+  AVFrame* frame = NULL;
+  receive_frame(native_frame, &frame);
+  return frame;
 }
 
-// packets must be decoded in order
-// indata must be inlen + AV_INPUT_BUFFER_PADDING_SIZE in length
-int ffmpeg_decode(unsigned char* indata, int inlen) {
-  int err;
+static int send_packet(unsigned char* indata, int inlen) {
+  if (decoder_ctx == NULL || pkt == NULL || inlen < 0 ||
+      (inlen > 0 && indata == NULL) || (inlen == 0 && indata != NULL))
+    return AVERROR(EINVAL);
 
-  pkt->data = indata;
-  pkt->size = inlen;
-
-  err = avcodec_send_packet(decoder_ctx, pkt);
-  if (err < 0) {
-    char errorstring[512];
-    av_strerror(err, errorstring, sizeof(errorstring));
-    fprintf(stderr, "Decode failed - %s\n", errorstring);
+  if (packet_pending && (indata != NULL || inlen != 0)) {
+    // The pending packet must be drained before accepting new input.
+    return AVERROR(EAGAIN);
   }
 
-  return err < 0 ? err : 0;
+  bool submitting = packet_pending || indata != NULL;
+  if (!packet_pending && submitting) {
+    // Own the packet until FFmpeg accepts it. In particular, do not lose the
+    // caller's buffer when avcodec_send_packet() asks us to receive first.
+    av_packet_unref(pkt);
+    int err = av_new_packet(pkt, inlen);
+    if (err < 0) {
+      log_av_error("Couldn't allocate encoded packet", err);
+      return err;
+    }
+    memcpy(pkt->data, indata, inlen);
+    // Validate the padded owned copy exactly once, before OMX can inspect a
+    // changed SPS. NULL/0 polls and retries of an EAGAIN packet bypass parsing.
+    if (ffmpeg_decoder == TH1520_OMX) {
+      err = th1520_validate_size(pkt->data, pkt->size);
+      if (err < 0) {
+        av_packet_unref(pkt);
+        return err;
+      }
+    }
+    packet_pending = true;
+  }
+
+  if (!packet_pending)
+    return 0;
+
+  int err = avcodec_send_packet(decoder_ctx, pkt);
+  if (err == AVERROR(EAGAIN))
+    return err;
+
+  packet_pending = false;
+  av_packet_unref(pkt);
+  if (err < 0)
+    log_av_error("Decode failed", err);
+  return err;
+}
+
+// Legacy callers only submit once and then receive; they do not implement the
+// saved-packet retry protocol. Return EAGAIN without retaining a pending packet
+// here, or their next input would be rejected forever. Callers requiring lossless
+// retries must use ffmpeg_decode_frame() instead. Do not mix the two APIs.
+int ffmpeg_decode(unsigned char* indata, int inlen) {
+  int err = send_packet(indata, inlen);
+  if (err == AVERROR(EAGAIN)) {
+    av_packet_unref(pkt);
+    packet_pending = false;
+  }
+  return err;
+}
+
+int ffmpeg_decode_frame(unsigned char* indata, int inlen, AVFrame** out_frame) {
+  if (out_frame == NULL)
+    return AVERROR(EINVAL);
+  *out_frame = NULL;
+
+  if (packet_pending && (indata != NULL || inlen != 0)) {
+    // Do not mistake rejection of new input for EAGAIN on the saved packet.
+    return AVERROR(EAGAIN);
+  }
+
+  bool submitting = packet_pending || indata != NULL || inlen != 0;
+  int send_err = send_packet(indata, inlen);
+  if (send_err < 0 && send_err != AVERROR(EAGAIN))
+    return send_err;
+
+  int status = 0;
+  if (send_err == AVERROR(EAGAIN))
+    status |= FFMPEG_DECODE_PACKET_PENDING;
+  else if (submitting)
+    status |= FFMPEG_DECODE_PACKET_ACCEPTED;
+
+  int receive_err = receive_frame(true, out_frame);
+  if (receive_err == 0)
+    status |= FFMPEG_DECODE_FRAME_AVAILABLE;
+  else if (receive_err != AVERROR(EAGAIN) && receive_err != AVERROR_EOF)
+    return receive_err;
+
+  return status;
 }
