@@ -10,6 +10,38 @@ Moonlight also has [PC](https://github.com/moonlight-stream/moonlight-qt), [Andr
 
 More information about installing and running Moonlight Embedded is available on the [wiki](https://github.com/moonlight-stream/moonlight-embedded/wiki).
 
+## TH1520 / RevyOS
+
+The `th1520` platform uses the RevyOS FFmpeg `h264_omx` and `hevc_omx` decoders, Bellagio OpenMAX IL and the `th1520-vpu` package. Video is displayed through X11 and EGL. Stock RevyOS FFmpeg defaults to NV12 hardware decode; the optional local FFmpeg lifetime fix enables automatic dma-buf/DRM PRIME output without the stock wrapper's per-frame memory growth. No V4L2 decoder or GStreamer pipeline is required.
+
+Install the build dependencies on RevyOS:
+
+```sh
+sudo apt install cmake pkg-config build-essential \
+  libavcodec-dev libavutil-dev libx11-dev libegl-dev libgles-dev libdrm-dev \
+  libevdev-dev libudev-dev libopus-dev libasound2-dev libpulse-dev libsdl2-dev \
+  libcurl4-gnutls-dev libssl-dev libexpat1-dev libavahi-client-dev uuid-dev
+```
+
+The `th1520-vpu` package, its kernel modules and an X11 desktop with EGL dma-buf import support must already be installed. Build with:
+
+```sh
+git submodule update --init --recursive
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+```
+
+From an X11 terminal, stream with:
+
+```sh
+./build/moonlight stream -platform th1520 -codec h264 -1080 -fps 60 \
+  -mapping third_party/SDL_GameControllerDB/gamecontrollerdb.txt <host>
+```
+
+When starting over SSH, export the existing desktop display first (usually `DISPLAY=:0`). The backend supports 8-bit H.264 and HEVC SDR. AV1, 10-bit video and HDR are rejected explicitly. Set `ENABLE_TH1520=OFF` to build without this backend.
+
+See the [TH1520 guide](<docs/TH1520.md>) for prerequisites, output-mode selection, recovery behavior, local integration tests and validation limitations.
+
 ## Bugs
 
 Please check the wiki and old bug reports before submitting a new bug report.
