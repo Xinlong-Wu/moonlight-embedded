@@ -29,6 +29,7 @@ option(ENABLE_X11 "Compile X11 support (requires ENABLE_FFMPEG)" ON)
 option(ENABLE_CEC "Compile CEC support" ON)
 option(ENABLE_PULSE "Compile PulseAudio support" ON)
 option(ENABLE_TH1520 "Compile TH1520 OpenMAX IL support (requires FFmpeg, X11 and libdrm)" ON)
+option(BUILD_TH1520_TESTS "Build the on-device TH1520 decode/display smoke test" OFF)
 
 pkg_check_modules(EVDEV REQUIRED libevdev)
 pkg_check_modules(UDEV REQUIRED libudev)
@@ -244,6 +245,22 @@ target_include_directories(moonlight PRIVATE ${GAMESTREAM_INCLUDE_DIR} ${MOONLIG
 target_link_libraries(moonlight ${EVDEV_LIBRARIES} ${OPUS_LIBRARY} ${UDEV_LIBRARIES} ${CMAKE_DL_LIBS})
 
 add_subdirectory(docs)
+
+if(BUILD_TH1520_TESTS)
+  if(NOT TH1520_FOUND)
+    message(FATAL_ERROR "BUILD_TH1520_TESTS requires the TH1520 X11 backend")
+  endif()
+  add_executable(th1520-smoke tests/th1520.c src/video/ffmpeg.c src/video/x11.c src/video/egl.c src/input/x11.c src/util.c)
+  target_compile_definitions(th1520-smoke PRIVATE HAVE_X11 HAVE_TH1520)
+  target_include_directories(th1520-smoke PRIVATE src ${MOONLIGHT_COMMON_INCLUDE_DIR}
+    ${AVCODEC_INCLUDE_DIRS} ${AVUTIL_INCLUDE_DIRS} ${XLIB_INCLUDE_DIRS} ${EGL_INCLUDE_DIRS} ${GLES_INCLUDE_DIRS} ${DRM_INCLUDE_DIRS})
+  target_link_libraries(th1520-smoke moonlight-common ${AVCODEC_LIBRARIES} ${AVUTIL_LIBRARIES}
+    ${XLIB_LIBRARIES} ${EGL_LIBRARIES} ${GLES_LIBRARIES} ${DRM_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT} ${CMAKE_DL_LIBS})
+  add_executable(th1520-unit tests/th1520-unit.c)
+  target_include_directories(th1520-unit PRIVATE ${MOONLIGHT_COMMON_INCLUDE_DIR} ${AVCODEC_INCLUDE_DIRS} ${AVUTIL_INCLUDE_DIRS})
+  target_link_libraries(th1520-unit ${AVCODEC_LIBRARIES} ${AVUTIL_LIBRARIES} "-Wl,--wrap=avcodec_send_packet")
+endif()
 
 install(TARGETS moonlight DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES ./third_party/SDL_GameControllerDB/gamecontrollerdb.txt DESTINATION ${CMAKE_INSTALL_DATADIR}/moonlight)
