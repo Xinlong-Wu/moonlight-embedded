@@ -1,6 +1,6 @@
 # TH1520 real-stream follow-up (2026-11-11)
 
-This follow-up fixes two issues exposed by real streaming after the initial local port. It does **not** claim that the tested 1080p60 host stream is now free of queue overflow.
+**Historical phase:** this follow-up records the tail/control-lock fixes before the later filler-data optimization. The queue-overflow measurements below were real at that stage. They are superseded for the tested H.264 workload by [vendor-send profiling and filler removal](<TH1520-VENDOR-PROFILE.md>), whose normal one-minute 1080p60 run had no queue overflow. The old observations remain here for traceability, not as the current throughput verdict.
 
 ## Implemented fixes
 
@@ -20,7 +20,7 @@ Input frame-number gaps are logged. A gap resuming at IDR is forwarded with its 
 
 The client line-buffers stdout when piped to `tee`, emits a startup marker, and reports submit, queue and render timings. FFmpeg API timings include time spent inside the API: `avcodec_send_packet()` can invoke the vendor receive path internally, so its duration is **not** just the encoded-memory-copy duration.
 
-Expected marker for the rebuilt H.264 client:
+Marker used by this earlier H.264 build (the current optimized build additionally includes `h264_filler=skip-valid`):
 
 ```text
 TH1520 pipeline: render_control=independent h264_tail=max-two-zero packet_metadata=key+pts
@@ -81,9 +81,9 @@ The HEVC real-stream comparison also retained SDK tail diagnostics; this follow-
 
 Audio setup/packet reception completed, but playback quality and A/V synchronization were not subjectively verified. Interactive input was intentionally disabled. Long live sessions, complex gameplay, 4K, and network-failure recovery remain unvalidated.
 
-## Recommended retest
+## Historical lower-load retest
 
-Rebuild and run from the repository root. Keep the private library prefix scoped to this process/shell. Start with the short-tested, lower-load H.264 setting; increase performance settings only while observing the new timings and overflow counts.
+The commands below record the conservative setting used before filler optimization. For the current tested 1080p60 setting and remaining validation limits, use the [main guide](<TH1520.md>) and [profiling follow-up](<TH1520-VENDOR-PROFILE.md>). Keep the private library prefix scoped to the process/shell.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TH1520_TESTS=ON

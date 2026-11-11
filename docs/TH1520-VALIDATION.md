@@ -2,7 +2,7 @@
 
 ## Scope
 
-The historical results below were collected on the current LicheePi 4A on 2026-11-10, before a target host was available. They establish native compilation, hardware decoding and real X11/EGL rendering using the production callback path, **not an end-to-end streaming result**. A [2026-11-11 real-stream follow-up](<TH1520-STREAM-FIX.md>) has since added input/control-lock fixes and limited view-only host tests; it also records remaining 1080p60 queue overflow. Do not interpret the local synthetic results below as proof of sustained live-stream throughput.
+The historical results below were collected on the current LicheePi 4A on 2026-11-10, before a target host was available. They establish native compilation, hardware decoding and real X11/EGL rendering using the production callback path, **not an end-to-end streaming result**. A [2026-11-11 real-stream follow-up](<TH1520-STREAM-FIX.md>) has since added input/control-lock fixes and limited view-only host tests; it also recorded 1080p60 queue overflow at that stage. A later [vendor-send investigation](<TH1520-VENDOR-PROFILE.md>) identified filler-NAL processing and verified the optimized H.264 workload without that overflow. Do not interpret the local synthetic results below as proof of sustained live-stream throughput.
 
 Environment:
 
@@ -68,4 +68,4 @@ Use the [build/run guide](<TH1520.md>) and [private dependency build script](<..
 - Actual GPU context loss, hardware bus errors or proprietary OMX deadlocks. The wrapper reports failures and avoids knowingly restarting over outstanding GPU references, but cannot time-limit a blocked vendor call from inside the shared library.
 - Full colorimetric accuracy or resistance to every malformed/multi-SPS bitstream. The public parser is a conservative size guard, not a complete security validator.
 
-Limited real-host tests are now recorded in the [follow-up](<TH1520-STREAM-FIX.md>). The presentation starvation and H.264 long-zero-tail diagnostics improved, but the tested 1080p60 stream still exceeds the observed vendor send-path budget. Initial retesting should use the documented lower-load H.264 mode rather than treating the entire end-to-end path as certified.
+The [first real-host follow-up](<TH1520-STREAM-FIX.md>) recorded improved presentation but unresolved send-path backlog. The subsequent [vendor investigation](<TH1520-VENDOR-PROFILE.md>) identified software filler-NAL processing and verified a normal one-minute H.264 1080p60/20 Mbps run without queue overflow. Use that newer result for the current client, while keeping long gameplay, interactive input and subjective A/V synchronization outside the certification claim.
