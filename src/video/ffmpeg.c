@@ -34,6 +34,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <errno.h>
+#include <inttypes.h>
 
 // General decoder and renderer state
 static AVPacket* pkt;
@@ -56,6 +57,7 @@ static enum AVCodecID th1520_parser_codec = AV_CODEC_ID_NONE;
 static int th1520_expected_width, th1520_expected_height;
 static int th1520_coded_width, th1520_coded_height;
 static int th1520_parser_error;
+static uint64_t filler_nal_count, filler_byte_count, filler_noop_count;
 
 enum decoders ffmpeg_decoder;
 
@@ -144,55 +146,106 @@ static int th1520_validate_size(const uint8_t* data, int size) {
   return 0;
 }
 
-// Normalize only a complete H.264 Annex-B AU owned by this sender. H.264
-// Annex B permits trailing_zero_8bits, and Moonlight retains FEC zero padding.
-// The Hantro NAL extractor instead diagnoses a long all-zero remainder as a
-// byte-stream error. An EBSP cannot contain three consecutive unescaped zero
-// bytes: emulation prevention must interrupt such a sequence. Keep up to two
-// final zeros because they may belong to CABAC cabac_zero_word / the final EBSP
-// byte, and discard only the excess all-zero tail. In particular, never turn a
-// terminal 00 00 03 00 into a truncated 00 00 03. Internal NALs and escape bytes
-// are copied verbatim. This is framing normalization, not full RBSP validation.
-static int th1520_normalize_h264_packet(AVPacket* packet) {
-  if (!packet || !packet->data || packet->size <= 0)
-    return AVERROR_INVALIDDATA;
-
-  const uint8_t* data = packet->data;
-  int last_header = -1;
-  for (int i = 0; i + 2 < packet->size; i++) {
+// Return a start-code prefix, excluding preceding Annex-B leading/trailing zeros.
+static int h264_start_code(const uint8_t* data, int size, int from, int* prefix) {
+  for (int i = from; i + 2 < size; i++) {
     if (data[i] || data[i + 1]) continue;
-    int prefix;
-    if (data[i + 2] == 1) prefix = 3;
-    else if (i + 3 < packet->size && data[i + 2] == 0 && data[i + 3] == 1) prefix = 4;
-    else continue;
-    if (last_header < 0) {
-      // Leading Annex-B zero bytes are allowed, arbitrary prepended data is not.
-      for (int j = 0; j < i; j++)
-        if (data[j] != 0) return AVERROR_INVALIDDATA;
+    if (data[i + 2] == 1) { *prefix = 3; return i; }
+    if (i + 3 < size && data[i + 2] == 0 && data[i + 3] == 1) {
+      *prefix = 4; return i;
     }
-    int header = i + prefix;
-    if (header >= packet->size || (data[header] & 0x80) ||
+  }
+  *prefix = 0;
+  return size;
+}
+
+// H.264 7.3.2.7 filler_data_rbsp: filler_ff_byte* followed by the byte-aligned
+// rbsp_trailing_bits (0x80). Remaining zeros belong to Annex-B framing. A type12
+// header alone is not sufficient: malformed/escaped/arbitrary payloads and any
+// nonzero nal_ref_idc are retained rather than silently discarded.
+static bool h264_valid_filler(const uint8_t* data, int header, int end) {
+  if (data[header] != 12) return false;
+  int cursor = header + 1;
+  while (cursor < end && data[cursor] == 0xff) cursor++;
+  if (cursor == end || data[cursor++] != 0x80) return false;
+  while (cursor < end && data[cursor] == 0) cursor++;
+  return cursor == end;
+}
+
+// Normalize only a complete H.264 Annex-B AU owned by this sender. Legal
+// filler_data NALs carry no decoded picture information but trigger a very slow
+// Hantro software path for static CBR streams; remove those NALs, not payloads
+// merely resembling them. Validate the full framing before in-place compaction.
+// All retained NAL bytes/EPBs and leading zeros are copied verbatim. Finally,
+// shorten only an excess all-zero AU tail to two zeros: these may belong to a
+// CABAC cabac_zero_word or terminal 00 00 03 00, so never trim to a dangling EPB.
+// An empty result means an all-legal-filler AU and must be consumed without
+// sending a zero-size AVPacket (which would signal EOS). This is not a full
+// malformed-bitstream/RBSP validator.
+static int th1520_normalize_h264_packet(AVPacket* packet) {
+  if (!packet || !packet->data || packet->size <= 0) return AVERROR_INVALIDDATA;
+  uint8_t* data = packet->data;
+  int original_size = packet->size;
+  int prefix, first = h264_start_code(data, original_size, 0, &prefix);
+  if (first == original_size) return AVERROR_INVALIDDATA;
+  for (int i = 0; i < first; i++)
+    if (data[i] != 0) return AVERROR_INVALIDDATA;
+
+  uint64_t removed_nals = 0, removed_bytes = 0;
+  int retained_nals = 0, position = first;
+  // First pass does not mutate the packet or counters, even if a later NAL is
+  // malformed. An embedded valid start code is a NAL boundary by definition.
+  while (position < original_size) {
+    int header = position + prefix;
+    if (header >= original_size || (data[header] & 0x80) ||
         (data[header] & 0x1f) == 0 || (data[header] & 0x1f) >= 24)
       return AVERROR_INVALIDDATA;
-    last_header = header;
-    i = header;
+    int next_prefix;
+    int next = h264_start_code(data, original_size, header + 1, &next_prefix);
+    if (h264_valid_filler(data, header, next)) {
+      removed_nals++;
+      removed_bytes += next - position;
+    } else {
+      retained_nals++;
+      int end = next;
+      while (end > header + 1 && data[end - 1] == 0) end--;
+      if (end == next && end - header >= 4 && data[end - 1] == 3 &&
+          data[end - 2] == 0 && data[end - 3] == 0)
+        return AVERROR_INVALIDDATA;
+    }
+    position = next;
+    prefix = next_prefix;
   }
-  if (last_header < 0) return AVERROR_INVALIDDATA;
 
-  int nonzero_end = packet->size;
-  while (nonzero_end > 0 && data[nonzero_end - 1] == 0) nonzero_end--;
-  if (nonzero_end <= last_header) return AVERROR_INVALIDDATA;
-  int zeros = packet->size - nonzero_end;
-  if (zeros == 0 && nonzero_end >= 3 && data[nonzero_end - 1] == 3 &&
-      data[nonzero_end - 2] == 0 && data[nonzero_end - 3] == 0)
-    return AVERROR_INVALIDDATA; // A dangling emulation_prevention_three_byte.
-
-  if (zeros > 2) {
-    packet->size = nonzero_end + 2;
-    // The allocation still has its original capacity, but FFmpeg requires the
-    // padding immediately after the new logical size to remain zero as well.
-    memset(packet->data + packet->size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+  if (!retained_nals) {
+    packet->size = 0;
+    memset(data, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+  } else if (removed_nals) {
+    int written = first;
+    position = h264_start_code(data, original_size, 0, &prefix);
+    while (position < original_size) {
+      int header = position + prefix;
+      int next_prefix;
+      int next = h264_start_code(data, original_size, header + 1, &next_prefix);
+      if (!h264_valid_filler(data, header, next)) {
+        memmove(data + written, data + position, next - position);
+        written += next - position;
+      }
+      position = next;
+      prefix = next_prefix;
+    }
+    packet->size = written;
   }
+
+  if (packet->size > 0) {
+    int nonzero_end = packet->size;
+    while (nonzero_end > 0 && data[nonzero_end - 1] == 0) nonzero_end--;
+    if (packet->size - nonzero_end > 2) packet->size = nonzero_end + 2;
+    // A shorter logical packet still requires zero padding at its new end.
+    memset(data + packet->size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+  }
+  filler_nal_count += removed_nals;
+  filler_byte_count += removed_bytes;
   return 0;
 }
 
@@ -416,6 +469,10 @@ void ffmpeg_destroy(void) {
            inspect_calls ? inspect_time_us / (1000.0 * inspect_calls) : 0.0,
            api_send_calls ? send_time_us / (1000.0 * api_send_calls) : 0.0, send_max_us / 1000.0,
            receive_calls ? receive_time_us / (1000.0 * receive_calls) : 0.0, receive_max_us / 1000.0);
+  if (ffmpeg_decoder == TH1520_OMX && (inspect_calls || filler_nal_count))
+    printf("TH1520 input: filler_nals_removed=%" PRIu64 " filler_bytes_removed=%" PRIu64 " filler_only_noops=%" PRIu64 "\n",
+           filler_nal_count, filler_byte_count, filler_noop_count);
+  filler_nal_count = filler_byte_count = filler_noop_count = 0;
   inspect_calls = inspect_time_us = api_send_calls = send_time_us = send_max_us = 0;
   receive_calls = receive_time_us = receive_max_us = 0;
   av_packet_free(&pkt);
@@ -553,6 +610,15 @@ static int send_packet_ex(unsigned char* indata, int inlen, bool key_frame, int6
           fprintf(stderr, "TH1520: invalid H.264 Annex-B access unit\n");
           av_packet_unref(pkt);
           return err;
+        }
+        if (pkt->size == 0) {
+          // An all-filler AU has no picture to decode. Consume it as accepted,
+          // but never submit a zero-size packet or convert this into EOS.
+          filler_noop_count++;
+          inspect_calls++;
+          inspect_time_us += av_gettime_relative() - inspect_begin;
+          av_packet_unref(pkt);
+          return 0;
         }
       }
       err = th1520_validate_size(pkt->data, pkt->size);

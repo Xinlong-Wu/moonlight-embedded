@@ -149,6 +149,142 @@ static void test_tail_framing(void) {
   av_packet_free(&sample);
 }
 
+static void expect_filtered(const uint8_t* input, int input_size, const uint8_t* expected,
+                            int expected_size, uint64_t nal_count, uint64_t byte_count,
+                            const char* description) {
+  AVPacket* sample = av_packet_alloc();
+  expect(sample && av_new_packet(sample, input_size) == 0, "allocate filler framing case");
+  memcpy(sample->data, input, input_size);
+  sample->flags = AV_PKT_FLAG_KEY; sample->pts = 12345678;
+  uint64_t before_nals = filler_nal_count, before_bytes = filler_byte_count;
+  expect(th1520_normalize_h264_packet(sample) == 0 && sample->size == expected_size &&
+         (expected_size == 0 || !memcmp(sample->data, expected, expected_size)) &&
+         sample->flags == AV_PKT_FLAG_KEY && sample->pts == 12345678 &&
+         filler_nal_count - before_nals == nal_count && filler_byte_count - before_bytes == byte_count,
+         description);
+  bool padding_zero = true;
+  for (int i = 0; i < AV_INPUT_BUFFER_PADDING_SIZE; i++)
+    if (sample->data[sample->size + i] != 0) padding_zero = false;
+  expect(padding_zero, "compacted/filler-only packet retains FFmpeg zero padding");
+  av_packet_free(&sample);
+}
+
+static void test_filler_framing(void) {
+  const uint8_t slice[] = {0,0,1,0x65,0,0,3,0,0x42,0x80,0,0};
+  const uint8_t filler3[] = {0,0,1,12,0xff,0xff,0x80};
+  const uint8_t filler4[] = {0,0,0,1,12,0x80};
+  const uint8_t leading[] = {0,0};
+  struct access_unit prefix = { .data = (uint8_t*)leading, .size = sizeof(leading) };
+  struct access_unit head = append_bytes(prefix, filler4, sizeof(filler4));
+  struct access_unit head_input = append_bytes(head, slice, sizeof(slice));
+  struct access_unit head_expected = append_bytes(prefix, slice, sizeof(slice));
+  expect_filtered(head_input.data, head_input.size, head_expected.data, head_expected.size,
+                  1, sizeof(filler4), "head filler removal preserves leading zeros and final escaped/cabac bytes");
+
+  const uint8_t config[] = {0,0,0,1,0x67,0x80,0,0,1,0x68,0x80};
+  struct access_unit config_au = { .data = (uint8_t*)config, .size = sizeof(config) };
+  struct access_unit middle = append_bytes(config_au, filler3, sizeof(filler3));
+  struct access_unit middle_input = append_bytes(middle, slice, sizeof(slice));
+  struct access_unit middle_expected = append_bytes(config_au, slice, sizeof(slice));
+  expect_filtered(middle_input.data, middle_input.size, middle_expected.data, middle_expected.size,
+                  1, sizeof(filler3), "middle filler removal preserves config, startcodes and internal EPB");
+
+  struct access_unit slice_au = { .data = (uint8_t*)slice, .size = sizeof(slice) };
+  struct access_unit tail = append_bytes(slice_au, filler4, sizeof(filler4));
+  struct access_unit tail_input = append_bytes(tail, NULL, 512);
+  expect_filtered(tail_input.data, tail_input.size, slice, sizeof(slice),
+                  1, sizeof(filler4) + 512, "tail filler and its transport zeros are removed without touching slice zero word");
+
+  struct access_unit filler_au = { .data = (uint8_t*)filler3, .size = sizeof(filler3) };
+  struct access_unit all_filler = append_bytes(filler_au, filler4, sizeof(filler4));
+  expect_filtered(all_filler.data, all_filler.size, NULL, 0, 2, sizeof(filler3) + sizeof(filler4),
+                  "all syntax-valid fillers compact to an intentional empty no-op");
+
+  const uint8_t nri[] = {0,0,1,0x2c,0xff,0x80};
+  const uint8_t arbitrary[] = {0,0,1,12,0xff,0x42,0x80};
+  const uint8_t missing_stop[] = {0,0,1,12,0xff,0xff};
+  const uint8_t after_stop[] = {0,0,0,1,12,0xff,0x80,1};
+  const uint8_t escaped[] = {0,0,1,12,0xff,0,0,3,0,0x80};
+  struct { const uint8_t* bytes; int size; } invalid_fillers[] = {
+    {nri, sizeof(nri)}, {arbitrary, sizeof(arbitrary)}, {missing_stop, sizeof(missing_stop)},
+    {after_stop, sizeof(after_stop)}, {escaped, sizeof(escaped)},
+  };
+  for (unsigned i = 0; i < sizeof(invalid_fillers) / sizeof(invalid_fillers[0]); i++)
+    expect_filtered(invalid_fillers[i].bytes, invalid_fillers[i].size,
+                    invalid_fillers[i].bytes, invalid_fillers[i].size, 0, 0,
+                    "malformed or reference type12 NAL is not blindly deleted");
+
+  const uint8_t bad_late[] = {0,0,1,12,0xff,0x80,0,0,1,0xe5,0x80};
+  AVPacket* invalid = av_packet_alloc();
+  expect(invalid && av_new_packet(invalid, sizeof(bad_late)) == 0, "allocate late-invalid-header case");
+  memcpy(invalid->data, bad_late, sizeof(bad_late));
+  uint64_t before_nals = filler_nal_count, before_bytes = filler_byte_count;
+  expect(th1520_normalize_h264_packet(invalid) == AVERROR_INVALIDDATA &&
+         invalid->size == sizeof(bad_late) && !memcmp(invalid->data, bad_late, sizeof(bad_late)) &&
+         filler_nal_count == before_nals && filler_byte_count == before_bytes,
+         "a late invalid header aborts before any compaction or stats update");
+  av_packet_free(&invalid);
+  av_free(head.data); av_free(head_input.data); av_free(head_expected.data);
+  av_free(middle.data); av_free(middle_input.data); av_free(middle_expected.data);
+  av_free(tail.data); av_free(tail_input.data); av_free(all_filler.data);
+}
+
+static void test_filler_sender(struct access_unit hd) {
+  const uint8_t filler[] = {0,0,0,1,12,0xff,0xff,0x80,0,0};
+  setup_mock_sender(AV_CODEC_ID_H264, 1920, 1080, true);
+  AVFrame* output = NULL;
+  mock_send_result = AVERROR(EAGAIN);
+  expect(ffmpeg_decode_frame_ex((unsigned char*)filler, sizeof(filler), true, 55, &output) == FFMPEG_DECODE_PACKET_ACCEPTED &&
+         !packet_pending && send_calls == 0 && pkt->size == 0 && filler_noop_count == 1 &&
+         filler_nal_count == 1 && filler_byte_count == sizeof(filler),
+         "filler-only is accepted before dimensions exist without sending a zero packet or EOS");
+  expect(ffmpeg_decode_frame_ex(NULL, 0, false, 0, &output) == 0 && !packet_pending && send_calls == 0 &&
+         filler_noop_count == 1, "poll after filler-only neither repeats normalization nor sends EOS");
+  expect(ffmpeg_decode((unsigned char*)filler, sizeof(filler)) == 0 && send_calls == 0 && filler_noop_count == 2,
+         "legacy filler-only consumption is also a no-op");
+
+  struct access_unit input = append_bytes(hd, filler, sizeof(filler));
+  mock_send_result = AVERROR(EAGAIN);
+  expect(ffmpeg_decode_frame_ex(input.data, input.size, true, 98765, &output) == FFMPEG_DECODE_PACKET_PENDING &&
+         packet_pending && send_calls == 1 && captured_packet->size == canonical_h264_size(hd.data, hd.size) &&
+         !memcmp(captured_packet->data, hd.data, captured_packet->size) && captured_padding_zero &&
+         captured_packet->flags == AV_PKT_FLAG_KEY && captured_packet->pts == 98765,
+         "mixed AU sends only retained picture/config bytes with original KEY and PTS");
+  uint64_t normalized_nals = filler_nal_count, normalized_bytes = filler_byte_count;
+  uint8_t* owned_data = captured_packet->data;
+  int owned_size = captured_packet->size;
+  expect(ffmpeg_decode_frame_ex((unsigned char*)filler, sizeof(filler), false, 0, &output) == AVERROR(EAGAIN) &&
+         send_calls == 1 && filler_noop_count == 2 && filler_nal_count == normalized_nals,
+         "filler-only cannot bypass or replace an older pending picture packet");
+  memset(input.data, 0xa5, input.size);
+  th1520_parser_error = AVERROR_INVALIDDATA;
+  mock_send_result = 0;
+  expect(ffmpeg_decode_frame_ex(NULL, 0, false, 1, &output) == FFMPEG_DECODE_PACKET_ACCEPTED &&
+         !packet_pending && send_calls == 2 && captured_packet->data == owned_data && captured_packet->size == owned_size &&
+         captured_packet->flags == AV_PKT_FLAG_KEY && captured_packet->pts == 98765 && captured_padding_zero &&
+         filler_nal_count == normalized_nals && filler_byte_count == normalized_bytes && filler_noop_count == 2,
+         "EAGAIN retry does not refilter/count and retains original filler-free bytes and metadata");
+  av_free(input.data);
+
+  setup_mock_sender(AV_CODEC_ID_H264, 1920, 1080, true);
+  const uint8_t invalid_filler[] = {0,0,1,12,0xff,0x42,0x80};
+  input = append_bytes(hd, invalid_filler, sizeof(invalid_filler));
+  expect(ffmpeg_decode_frame_ex(input.data, input.size, false, 777, &output) == FFMPEG_DECODE_PACKET_ACCEPTED &&
+         captured_packet->size == input.size && !memcmp(captured_packet->data, input.data, input.size) &&
+         filler_nal_count == 0 && filler_byte_count == 0,
+         "actual sender retains a malformed type12 payload instead of concealing it");
+  av_free(input.data);
+
+  setup_mock_sender(AV_CODEC_ID_H264, 1920, 1080, false);
+  expect(ffmpeg_decode_frame_ex((unsigned char*)filler, sizeof(filler), true, 666, &output) == FFMPEG_DECODE_PACKET_ACCEPTED &&
+         send_calls == 1 && captured_packet->size == sizeof(filler) &&
+         !memcmp(captured_packet->data, filler, sizeof(filler)) &&
+         captured_packet->flags == AV_PKT_FLAG_KEY && captured_packet->pts == 666 &&
+         filler_nal_count == 0 && filler_noop_count == 0,
+         "non-TH1520 sender forwards legal filler-only bytes unchanged");
+  ffmpeg_destroy();
+}
+
 static void test_packet_normalization(struct access_unit hd) {
   setup_mock_sender(AV_CODEC_ID_H264, 1920, 1080, true);
   uint8_t* input = av_mallocz((size_t)hd.size + 1024 + AV_INPUT_BUFFER_PADDING_SIZE);
@@ -244,6 +380,13 @@ static void test_legacy_and_other_codecs(struct access_unit hd, struct access_un
          captured_packet->flags == AV_PKT_FLAG_KEY && captured_packet->pts == 3456789,
          "TH1520 HEVC bytes and tail are untouched while metadata is forwarded");
   av_free(padded.data);
+  const uint8_t hevc_filler[] = {0,0,0,1,0x4c,1,0xff,0xff,0x80,0,0};
+  padded = append_bytes(hevc, hevc_filler, sizeof(hevc_filler));
+  expect(ffmpeg_decode_frame_ex(padded.data, padded.size, false, 4567890, &output) == FFMPEG_DECODE_PACKET_ACCEPTED &&
+         captured_packet->size == padded.size && !memcmp(captured_packet->data, padded.data, padded.size) &&
+         filler_nal_count == 0 && filler_noop_count == 0,
+         "TH1520 HEVC filler NALs are not modified by the H264 workaround");
+  av_free(padded.data);
 
   setup_mock_sender(AV_CODEC_ID_H264, 1920, 1080, false);
   padded = append_bytes(hd, NULL, 512);
@@ -304,6 +447,8 @@ int main(int argc, char** argv) {
   expect(th1520_validate_size(hevc.data, hevc.size) == 0, "HEVC size validation");
 
   test_tail_framing();
+  test_filler_framing();
+  test_filler_sender(hd);
   test_packet_normalization(hd);
   test_pending_metadata(hd, p);
   test_legacy_and_other_codecs(hd, hevc);

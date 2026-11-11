@@ -278,8 +278,9 @@ static int x11_setup(int videoFormat, int width, int height, int redrawRate, voi
     require_drm = mode && !strcmp(mode, "drm");
     force_nv12 = mode && !strcmp(mode, "nv12");
     avc_flags = TH1520_ACCELERATION | (force_nv12 ? TH1520_NV12 : 0);
-    printf("TH1520 pipeline: render_control=independent h264_tail=%s packet_metadata=key+pts\n",
-           videoFormat == VIDEO_FORMAT_H264 ? "max-two-zero" : "unchanged");
+    printf("TH1520 pipeline: render_control=independent h264_tail=%s h264_filler=%s packet_metadata=key+pts\n",
+           videoFormat == VIDEO_FORMAT_H264 ? "max-two-zero" : "unchanged",
+           videoFormat == VIDEO_FORMAT_H264 ? "skip-valid" : "unchanged");
   } else
 #endif
   if (drFlags & X11_VDPAU_ACCELERATION) avc_flags = VDPAU_ACCELERATION;

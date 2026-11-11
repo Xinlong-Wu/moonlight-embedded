@@ -78,7 +78,10 @@ int ffmpeg_decode_frame(unsigned char* indata, int inlen, AVFrame** out_frame);
 // timestamp are retained across EAGAIN. pts_us is in microseconds; use
 // AV_NOPTS_VALUE when unavailable. NULL/0 retries ignore key_frame/pts_us and
 // never signal EOS. The old wrapper supplies false and AV_NOPTS_VALUE.
-// Only TH1520 H.264 Annex-B input has excess all-zero transport tails shortened
-// to at most two zeros, preserving possible CABAC/terminal escaped-zero bytes.
-// Internal NALs/EPBs, HEVC input and other backends are not rewritten.
+// Only TH1520 H.264 Annex-B input has syntax-valid non-reference filler_data
+// NALs (type12, FF* 80 plus zero tail) removed and excess all-zero transport tails
+// shortened to two zeros, preserving possible CABAC/terminal escaped-zero bytes.
+// An AU consisting entirely of legal filler is accepted without sending any
+// packet/EOS. Removal counts are summarized on destroy, not logged per frame.
+// Other NALs/EPBs, malformed type12 payloads, HEVC and other backends are retained.
 int ffmpeg_decode_frame_ex(unsigned char* indata, int inlen, bool key_frame, int64_t pts_us, AVFrame** out_frame);
