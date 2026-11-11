@@ -22,6 +22,7 @@ find_package(Amlogic)
 find_package(Rockchip)
 
 find_package(PkgConfig REQUIRED)
+find_package(Threads REQUIRED)
 
 option(ENABLE_SDL "Compile SDL support" ON)
 option(ENABLE_FFMPEG "Compile FFMPEG support" ON)
@@ -260,6 +261,14 @@ if(BUILD_TH1520_TESTS)
   add_executable(th1520-unit tests/th1520-unit.c)
   target_include_directories(th1520-unit PRIVATE ${MOONLIGHT_COMMON_INCLUDE_DIR} ${AVCODEC_INCLUDE_DIRS} ${AVUTIL_INCLUDE_DIRS})
   target_link_libraries(th1520-unit ${AVCODEC_LIBRARIES} ${AVUTIL_LIBRARIES} "-Wl,--wrap=avcodec_send_packet")
+  add_executable(th1520-lock-unit tests/th1520-lock-unit.c)
+  target_compile_definitions(th1520-lock-unit PRIVATE HAVE_X11 HAVE_TH1520)
+  target_include_directories(th1520-lock-unit PRIVATE ${MOONLIGHT_COMMON_INCLUDE_DIR}
+    ${AVCODEC_INCLUDE_DIRS} ${AVUTIL_INCLUDE_DIRS} ${XLIB_INCLUDE_DIRS} ${EGL_INCLUDE_DIRS} ${GLES_INCLUDE_DIRS})
+  target_link_libraries(th1520-lock-unit ${AVCODEC_LIBRARIES} ${AVUTIL_LIBRARIES} ${XLIB_LIBRARIES} Threads::Threads)
+  add_executable(th1520-normalize-fixture tests/th1520-normalize-fixture.c)
+  target_include_directories(th1520-normalize-fixture PRIVATE ${MOONLIGHT_COMMON_INCLUDE_DIR} ${AVCODEC_INCLUDE_DIRS} ${AVUTIL_INCLUDE_DIRS})
+  target_link_libraries(th1520-normalize-fixture ${AVCODEC_LIBRARIES} ${AVUTIL_LIBRARIES})
 endif()
 
 install(TARGETS moonlight DESTINATION ${CMAKE_INSTALL_BINDIR})

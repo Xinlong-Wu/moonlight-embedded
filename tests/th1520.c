@@ -12,6 +12,8 @@
  * pending UI messages for another 250 ms. Supply a colorful Annex-B sample
  * beginning with an IDR and its SPS/PPS (and VPS for HEVC).
  * Optional: MOONLIGHT_TH1520_SCREENSHOT=output.ppm saves the final X11 image.
+ * TEST_TAIL_PADDING=0..1024, TEST_BURST=1..32 and TEST_FULLSCREEN=1 (all
+ * prefixed MOONLIGHT_TH1520_) cover real-transport framing/presentation cases.
  * Run under an external timeout: vendor OMX calls may themselves block.
  */
 #define _POSIX_C_SOURCE 200809L
@@ -55,6 +57,10 @@ static bool loop_failed;
 static unsigned x_errors;
 static bool threaded_mode;
 static int render_delay_ms;
+static int tail_padding_bytes;
+static int burst_size = 1;
+static bool test_fullscreen;
+static const uint8_t zero_tail[1024];
 static pthread_mutex_t producer_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool producer_done, producer_cancelled;
 static int producer_result;
@@ -346,7 +352,8 @@ static int submit_au(struct session* session, const uint8_t* data, int size) {
   // A NAL needs at least a start code plus one header byte; this bounds count.
   size_t capacity = (size_t)size / 4 + 4;
   if (capacity > MAX_NALS + 3) capacity = MAX_NALS + 3;
-  LENTRY* entries = calloc(capacity, sizeof(*entries));
+  // Reserve one extra PICDATA entry for transport-style tail padding.
+  LENTRY* entries = calloc(capacity + 1, sizeof(*entries));
   if (!entries) return -1;
   size_t body_count = 0;
   bool key = false, vcl = false, has_configuration = false;
@@ -394,11 +401,15 @@ static int submit_au(struct session* session, const uint8_t* data, int size) {
     if (session->hevc && session->parameters[2].data)
       entries[--first] = (LENTRY) { .data = (char*)session->parameters[2].data, .length = session->parameters[2].length, .bufferType = BUFFER_TYPE_VPS };
   }
+  size_t entry_end = 3 + body_count;
+  if (tail_padding_bytes) {
+    entries[entry_end++] = (LENTRY) { .data = (char*)zero_tail, .length = tail_padding_bytes, .bufferType = BUFFER_TYPE_PICDATA };
+  }
   int full_length = 0;
-  for (size_t i = first; i < 3 + body_count; i++) {
+  for (size_t i = first; i < entry_end; i++) {
     if (entries[i].length <= 0 || entries[i].length > INT_MAX - full_length) goto malformed;
     full_length += entries[i].length;
-    entries[i].next = i + 1 < 3 + body_count ? &entries[i + 1] : NULL;
+    entries[i].next = i + 1 < entry_end ? &entries[i + 1] : NULL;
   }
   if (!session->started) {
     session->start_ns = monotonic_ns();
@@ -411,7 +422,7 @@ static int submit_au(struct session* session, const uint8_t* data, int size) {
   unit.bufferList = &entries[first];
   unit.presentationTimeUs = (uint64_t)session->submitted * 1000000 / (unsigned)session->fps;
   unit.rtpTimestamp = (uint32_t)((uint64_t)session->submitted * 90000 / (unsigned)session->fps);
-  unit.receiveTimeUs = unit.enqueueTimeUs = monotonic_ns() / 1000;
+  unit.receiveTimeUs = unit.enqueueTimeUs = LiGetMicroseconds();
   unit.colorspace = COLORSPACE_REC_709;
   int result = session->callbacks->submitDecodeUnit(&unit);
   free(entries);
@@ -422,14 +433,15 @@ static int submit_au(struct session* session, const uint8_t* data, int size) {
   }
   session->submitted++;
   uint64_t deadline = session->start_ns + (uint64_t)session->submitted * 1000000000 / (unsigned)session->fps;
-  if (threaded_mode) {
+  bool pace = session->submitted % (unsigned)burst_size == 0 || session->submitted >= session->limit;
+  if (threaded_mode && pace) {
     uint64_t now;
     while ((now = monotonic_ns()) < deadline && !cancelled()) {
       uint64_t ns = deadline - now;
       struct timespec delay = { .tv_sec = ns / 1000000000, .tv_nsec = ns % 1000000000 };
       if (nanosleep(&delay, NULL) < 0 && errno != EINTR) return -1;
     }
-  } else if (dispatch_until(deadline) < 0) return -1;
+  } else if (!threaded_mode && dispatch_until(pace ? deadline : monotonic_ns()) < 0) return -1;
   if (session->submitted % ((unsigned)session->fps * 10) == 0)
     printf("STREAM submitted=%u elapsed_ms=%" PRIu64 " rss_kib=%ld fd_count=%ld\n",
            session->submitted, (monotonic_ns() - session->start_ns) / 1000000, rss_kib(), count_fds());
@@ -593,7 +605,16 @@ int main(int argc, char** argv) {
     fprintf(stderr, "MOONLIGHT_TH1520_TEST_RENDER_DELAY_MS must be 0..1000\n");
     return 2;
   }
-  printf("THREADING producer=%s renderer=main delay_ms=%d\n", threaded_mode ? "worker" : "main", render_delay_ms);
+  const char* padding_option = getenv("MOONLIGHT_TH1520_TEST_TAIL_PADDING");
+  const char* burst_option = getenv("MOONLIGHT_TH1520_TEST_BURST");
+  test_fullscreen = getenv("MOONLIGHT_TH1520_TEST_FULLSCREEN") != NULL;
+  if ((padding_option && parse_integer(padding_option, 0, 1024, &tail_padding_bytes) < 0) ||
+      (burst_option && parse_integer(burst_option, 1, 32, &burst_size) < 0)) {
+    fprintf(stderr, "TEST_TAIL_PADDING must be 0..1024; TEST_BURST must be 1..32\n");
+    return 2;
+  }
+  printf("THREADING producer=%s renderer=main delay_ms=%d tail_padding=%d burst=%d fullscreen=%d\n",
+         threaded_mode ? "worker" : "main", render_delay_ms, tail_padding_bytes, burst_size, test_fullscreen);
   size_t length = 0;
   uint8_t* data = load_input(argv[1], &length);
   if (!data) return 1;
@@ -623,7 +644,7 @@ int main(int argc, char** argv) {
       break;
     }
     int format = !strcmp(argv[2], "h265") ? VIDEO_FORMAT_H265 : VIDEO_FORMAT_H264;
-    if (callbacks->setup(format, width, height, fps, NULL, DISPLAY_VIEW_ONLY) != 0) {
+    if (callbacks->setup(format, width, height, fps, NULL, DISPLAY_VIEW_ONLY | (test_fullscreen ? DISPLAY_FULLSCREEN : 0)) != 0) {
       fprintf(stderr, "FAIL: production TH1520 setup failed\n");
       exit_status = 1;
       break;
