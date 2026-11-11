@@ -34,13 +34,13 @@ cmake --build build -j$(nproc)
 From an X11 terminal, stream with:
 
 ```sh
-./build/moonlight stream -platform th1520 -codec h264 -1080 -fps 60 \
+./build/moonlight stream -platform th1520 -codec h264 -1080 -fps 30 -bitrate 10000 \
   -mapping third_party/SDL_GameControllerDB/gamecontrollerdb.txt <host>
 ```
 
 When starting over SSH, export the existing desktop display first (usually `DISPLAY=:0`). The backend supports 8-bit H.264 and HEVC SDR. AV1, 10-bit video and HDR are rejected explicitly. Set `ENABLE_TH1520=OFF` to build without this backend.
 
-See the [TH1520 guide](<docs/TH1520.md>) for prerequisites, output-mode selection, recovery behavior, local integration tests and validation limitations.
+See the [TH1520 guide](<docs/TH1520.md>) for prerequisites and the [real-stream follow-up](<docs/TH1520-STREAM-FIX.md>) for H.264 tail-padding/control-lock fixes and their measured limits. The tested 1080p60 live stream still overflows its input queue; local synthetic 60 FPS tests are not a guarantee of live-stream throughput.
 
 ## Bugs
 
