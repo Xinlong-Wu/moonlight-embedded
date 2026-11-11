@@ -18,6 +18,7 @@
  */
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include <libavcodec/avcodec.h>
 
@@ -72,3 +73,12 @@ int ffmpeg_decode(unsigned char* indata, int inlen);
 // release all cloned/displayed frames before rebuilding it. NULL/0 polls only:
 // it does not signal end-of-stream to the decoder.
 int ffmpeg_decode_frame(unsigned char* indata, int inlen, AVFrame** out_frame);
+
+// Extended form: the original new packet's key-frame flag and presentation
+// timestamp are retained across EAGAIN. pts_us is in microseconds; use
+// AV_NOPTS_VALUE when unavailable. NULL/0 retries ignore key_frame/pts_us and
+// never signal EOS. The old wrapper supplies false and AV_NOPTS_VALUE.
+// Only TH1520 H.264 Annex-B input has excess all-zero transport tails shortened
+// to at most two zeros, preserving possible CABAC/terminal escaped-zero bytes.
+// Internal NALs/EPBs, HEVC input and other backends are not rewritten.
+int ffmpeg_decode_frame_ex(unsigned char* indata, int inlen, bool key_frame, int64_t pts_us, AVFrame** out_frame);

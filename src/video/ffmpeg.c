@@ -26,6 +26,7 @@
 #include <Limelight.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/opt.h>
+#include <libavutil/time.h>
 
 #include <stdlib.h>
 #include <pthread.h>
@@ -43,6 +44,8 @@ static AVFrame** dec_frames;
 static int dec_frames_cnt;
 static int current_frame, next_frame;
 static bool packet_pending;
+static uint64_t inspect_calls, inspect_time_us, api_send_calls, send_time_us, send_max_us;
+static uint64_t receive_calls, receive_time_us, receive_max_us;
 
 // Parse compressed TH1520 input independently of the OMX component. The vendor
 // wrapper may return/reallocate output buffers as soon as it sees a changed SPS,
@@ -138,6 +141,58 @@ static int th1520_validate_size(const uint8_t* data, int size) {
   }
   th1520_coded_width = th1520_parser->coded_width;
   th1520_coded_height = th1520_parser->coded_height;
+  return 0;
+}
+
+// Normalize only a complete H.264 Annex-B AU owned by this sender. H.264
+// Annex B permits trailing_zero_8bits, and Moonlight retains FEC zero padding.
+// The Hantro NAL extractor instead diagnoses a long all-zero remainder as a
+// byte-stream error. An EBSP cannot contain three consecutive unescaped zero
+// bytes: emulation prevention must interrupt such a sequence. Keep up to two
+// final zeros because they may belong to CABAC cabac_zero_word / the final EBSP
+// byte, and discard only the excess all-zero tail. In particular, never turn a
+// terminal 00 00 03 00 into a truncated 00 00 03. Internal NALs and escape bytes
+// are copied verbatim. This is framing normalization, not full RBSP validation.
+static int th1520_normalize_h264_packet(AVPacket* packet) {
+  if (!packet || !packet->data || packet->size <= 0)
+    return AVERROR_INVALIDDATA;
+
+  const uint8_t* data = packet->data;
+  int last_header = -1;
+  for (int i = 0; i + 2 < packet->size; i++) {
+    if (data[i] || data[i + 1]) continue;
+    int prefix;
+    if (data[i + 2] == 1) prefix = 3;
+    else if (i + 3 < packet->size && data[i + 2] == 0 && data[i + 3] == 1) prefix = 4;
+    else continue;
+    if (last_header < 0) {
+      // Leading Annex-B zero bytes are allowed, arbitrary prepended data is not.
+      for (int j = 0; j < i; j++)
+        if (data[j] != 0) return AVERROR_INVALIDDATA;
+    }
+    int header = i + prefix;
+    if (header >= packet->size || (data[header] & 0x80) ||
+        (data[header] & 0x1f) == 0 || (data[header] & 0x1f) >= 24)
+      return AVERROR_INVALIDDATA;
+    last_header = header;
+    i = header;
+  }
+  if (last_header < 0) return AVERROR_INVALIDDATA;
+
+  int nonzero_end = packet->size;
+  while (nonzero_end > 0 && data[nonzero_end - 1] == 0) nonzero_end--;
+  if (nonzero_end <= last_header) return AVERROR_INVALIDDATA;
+  int zeros = packet->size - nonzero_end;
+  if (zeros == 0 && nonzero_end >= 3 && data[nonzero_end - 1] == 3 &&
+      data[nonzero_end - 2] == 0 && data[nonzero_end - 3] == 0)
+    return AVERROR_INVALIDDATA; // A dangling emulation_prevention_three_byte.
+
+  if (zeros > 2) {
+    packet->size = nonzero_end + 2;
+    // The allocation still has its original capacity, but FFmpeg requires the
+    // padding immediately after the new logical size to remain zero as well.
+    memset(packet->data + packet->size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+  }
   return 0;
 }
 
@@ -254,6 +309,9 @@ int ffmpeg_init(int videoFormat, int width, int height, int perf_lvl, int buffer
 
     if (ffmpeg_decoder == TH1520_OMX) {
       decoder_ctx->thread_count = 1;
+      // Moonlight presentation timestamps and OMX nTimeStamp are microseconds.
+      decoder_ctx->time_base = (AVRational) { 1, AV_TIME_BASE };
+      decoder_ctx->pkt_timebase = decoder_ctx->time_base;
     } else if (perf_lvl & SLICE_THREADING) {
       decoder_ctx->thread_type = FF_THREAD_SLICE;
       decoder_ctx->thread_count = thread_count;
@@ -353,6 +411,13 @@ fail:
 // This function must be called after
 // decoding is finished
 void ffmpeg_destroy(void) {
+  if (ffmpeg_decoder == TH1520_OMX && (api_send_calls || receive_calls))
+    printf("TH1520 API timing: inspect_avg_ms=%.3f send_avg_ms=%.3f send_max_ms=%.3f receive_avg_ms=%.3f receive_max_ms=%.3f\n",
+           inspect_calls ? inspect_time_us / (1000.0 * inspect_calls) : 0.0,
+           api_send_calls ? send_time_us / (1000.0 * api_send_calls) : 0.0, send_max_us / 1000.0,
+           receive_calls ? receive_time_us / (1000.0 * receive_calls) : 0.0, receive_max_us / 1000.0);
+  inspect_calls = inspect_time_us = api_send_calls = send_time_us = send_max_us = 0;
+  receive_calls = receive_time_us = receive_max_us = 0;
   av_packet_free(&pkt);
   packet_pending = false;
   if (th1520_parser) av_parser_close(th1520_parser);
@@ -426,7 +491,11 @@ static int receive_frame(bool native_frame, AVFrame** out_frame) {
   if (decoder_ctx == NULL || dec_frames == NULL)
     return AVERROR(EINVAL);
 
+  int64_t begin = av_gettime_relative();
   int err = avcodec_receive_frame(decoder_ctx, dec_frames[next_frame]);
+  uint64_t elapsed = av_gettime_relative() - begin;
+  receive_calls++; receive_time_us += elapsed;
+  if (elapsed > receive_max_us) receive_max_us = elapsed;
   if (err == 0 && ffmpeg_decoder == SOFTWARE) {
     err = normalize_software_frame(dec_frames[next_frame]);
     if (err < 0) av_frame_unref(dec_frames[next_frame]);
@@ -449,7 +518,7 @@ AVFrame* ffmpeg_get_frame(bool native_frame) {
   return frame;
 }
 
-static int send_packet(unsigned char* indata, int inlen) {
+static int send_packet_ex(unsigned char* indata, int inlen, bool key_frame, int64_t pts_us) {
   if (decoder_ctx == NULL || pkt == NULL || inlen < 0 ||
       (inlen > 0 && indata == NULL) || (inlen == 0 && indata != NULL))
     return AVERROR(EINVAL);
@@ -470,14 +539,29 @@ static int send_packet(unsigned char* indata, int inlen) {
       return err;
     }
     memcpy(pkt->data, indata, inlen);
-    // Validate the padded owned copy exactly once, before OMX can inspect a
-    // changed SPS. NULL/0 polls and retries of an EAGAIN packet bypass parsing.
+    pkt->flags = key_frame ? AV_PKT_FLAG_KEY : 0;
+    pkt->pts = pts_us;
+    // No independent decode timestamp is provided by this API.
+    pkt->dts = AV_NOPTS_VALUE;
+    // Normalize and validate the owned copy once, before OMX sees it. NULL/0
+    // retries retain exactly the original bytes, flags and microsecond PTS.
     if (ffmpeg_decoder == TH1520_OMX) {
+      int64_t inspect_begin = av_gettime_relative();
+      if (th1520_parser_codec == AV_CODEC_ID_H264) {
+        err = th1520_normalize_h264_packet(pkt);
+        if (err < 0) {
+          fprintf(stderr, "TH1520: invalid H.264 Annex-B access unit\n");
+          av_packet_unref(pkt);
+          return err;
+        }
+      }
       err = th1520_validate_size(pkt->data, pkt->size);
       if (err < 0) {
         av_packet_unref(pkt);
         return err;
       }
+      inspect_calls++;
+      inspect_time_us += av_gettime_relative() - inspect_begin;
     }
     packet_pending = true;
   }
@@ -485,7 +569,11 @@ static int send_packet(unsigned char* indata, int inlen) {
   if (!packet_pending)
     return 0;
 
+  int64_t begin = av_gettime_relative();
   int err = avcodec_send_packet(decoder_ctx, pkt);
+  uint64_t elapsed = av_gettime_relative() - begin;
+  api_send_calls++; send_time_us += elapsed;
+  if (elapsed > send_max_us) send_max_us = elapsed;
   if (err == AVERROR(EAGAIN))
     return err;
 
@@ -494,6 +582,10 @@ static int send_packet(unsigned char* indata, int inlen) {
   if (err < 0)
     log_av_error("Decode failed", err);
   return err;
+}
+
+static int send_packet(unsigned char* indata, int inlen) {
+  return send_packet_ex(indata, inlen, false, AV_NOPTS_VALUE);
 }
 
 // Legacy callers only submit once and then receive; they do not implement the
@@ -509,7 +601,7 @@ int ffmpeg_decode(unsigned char* indata, int inlen) {
   return err;
 }
 
-int ffmpeg_decode_frame(unsigned char* indata, int inlen, AVFrame** out_frame) {
+int ffmpeg_decode_frame_ex(unsigned char* indata, int inlen, bool key_frame, int64_t pts_us, AVFrame** out_frame) {
   if (out_frame == NULL)
     return AVERROR(EINVAL);
   *out_frame = NULL;
@@ -520,7 +612,7 @@ int ffmpeg_decode_frame(unsigned char* indata, int inlen, AVFrame** out_frame) {
   }
 
   bool submitting = packet_pending || indata != NULL || inlen != 0;
-  int send_err = send_packet(indata, inlen);
+  int send_err = send_packet_ex(indata, inlen, key_frame, pts_us);
   if (send_err < 0 && send_err != AVERROR(EAGAIN))
     return send_err;
 
@@ -537,4 +629,8 @@ int ffmpeg_decode_frame(unsigned char* indata, int inlen, AVFrame** out_frame) {
     return receive_err;
 
   return status;
+}
+
+int ffmpeg_decode_frame(unsigned char* indata, int inlen, AVFrame** out_frame) {
+  return ffmpeg_decode_frame_ex(indata, inlen, false, AV_NOPTS_VALUE, out_frame);
 }

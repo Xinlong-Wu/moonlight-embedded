@@ -6,9 +6,16 @@
 #include <limits.h>
 
 static int send_calls, mock_send_result;
+static AVPacket* captured_packet;
+static bool captured_padding_zero;
 int __wrap_avcodec_send_packet(AVCodecContext* context, const AVPacket* packet) {
-  (void)context; (void)packet;
+  (void)context;
   send_calls++;
+  av_packet_unref(captured_packet);
+  if (!packet || av_packet_ref(captured_packet, packet) < 0) abort();
+  captured_padding_zero = true;
+  for (int i = 0; i < AV_INPUT_BUFFER_PADDING_SIZE; i++)
+    if (packet->data[packet->size + i] != 0) captured_padding_zero = false;
   return mock_send_result;
 }
 struct access_unit { uint8_t* data; int size; };
@@ -65,6 +72,189 @@ static void setup_guard(enum AVCodecID codec, int width, int height) {
   expect(th1520_reset_parser() == 0, "initialize size guard without hardware");
 }
 
+// Use a real software receive context with a wrapped sender: receive returns
+// EAGAIN because no packet reaches it. No OMX component is opened by these tests.
+static void setup_mock_sender(enum AVCodecID codec, int width, int height, bool th1520) {
+  if (th1520) setup_guard(codec, width, height);
+  else { ffmpeg_destroy(); ffmpeg_decoder = SOFTWARE; }
+  decoder = avcodec_find_decoder_by_name(codec == AV_CODEC_ID_HEVC ? "hevc" : "h264");
+  expect(decoder != NULL, "find CPU-only decoder for mocked receive");
+  decoder_ctx = avcodec_alloc_context3(decoder);
+  expect(decoder_ctx != NULL, "allocate mocked receive context");
+  decoder_ctx->width = width; decoder_ctx->height = height;
+  decoder_ctx->thread_count = 1;
+  decoder_ctx->time_base = (AVRational) { 1, AV_TIME_BASE };
+  decoder_ctx->pkt_timebase = decoder_ctx->time_base;
+  expect(avcodec_open2(decoder_ctx, decoder, NULL) == 0, "open software-only receive context");
+  pkt = av_packet_alloc();
+  dec_frames_cnt = 1;
+  dec_frames = calloc(1, sizeof(*dec_frames));
+  expect(pkt && dec_frames, "allocate mocked sender frame ring");
+  dec_frames[0] = av_frame_alloc();
+  expect(dec_frames[0] != NULL, "allocate receive frame");
+  send_calls = 0; mock_send_result = 0;
+  av_packet_unref(captured_packet);
+}
+
+static struct access_unit append_bytes(struct access_unit input, const uint8_t* suffix, int length) {
+  struct access_unit result = { .size = input.size + length };
+  result.data = av_mallocz((size_t)result.size + AV_INPUT_BUFFER_PADDING_SIZE);
+  expect(result.data != NULL, "allocate extended AU");
+  memcpy(result.data, input.data, input.size);
+  if (suffix) memcpy(result.data + input.size, suffix, length);
+  return result;
+}
+
+static int canonical_h264_size(const uint8_t* data, int size) {
+  int end = size;
+  while (end > 0 && data[end - 1] == 0) end--;
+  return end + (size - end > 2 ? 2 : size - end);
+}
+
+static void test_tail_framing(void) {
+  const uint8_t cabac[] = {0,0,0,1,0x65,0x80,0,0};
+  const uint8_t escaped[] = {0,0,1,0x65,0x80,0,0,3,0};
+  const uint8_t escaped_word[] = {0,0,1,0x65,0x80,0,0,3,0,0};
+  const uint8_t internal[] = {0,0,0,1,0x67,0x80,0,0,1,0x68,0x80,0,0,1,0x65,0,0,3,0,0x42,0x80};
+  const uint8_t all_zero[] = {0,0,0,0,0,0,0,0};
+  const uint8_t avcc[] = {0,0,0,4,0x65,0x80,0x20,0x80};
+  const uint8_t dangling_epb[] = {0,0,1,0x65,0x80,0,0,3};
+  const uint8_t dangling_prefix[] = {0,0,1,0x65,0x80,0,0,1};
+  const uint8_t forbidden[] = {0,0,1,0xe5,0x80};
+  struct framing_case { const uint8_t* bytes; int size; bool valid; } cases[] = {
+    {cabac, sizeof(cabac), true}, {escaped, sizeof(escaped), true},
+    {escaped_word, sizeof(escaped_word), true}, {internal, sizeof(internal), true},
+    {all_zero, sizeof(all_zero), false}, {avcc, sizeof(avcc), false},
+    {dangling_epb, sizeof(dangling_epb), false},
+    {dangling_prefix, sizeof(dangling_prefix), false}, {forbidden, sizeof(forbidden), false},
+  };
+  for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    AVPacket* sample = av_packet_alloc();
+    expect(sample && av_new_packet(sample, cases[i].size) == 0, "allocate framing case");
+    memcpy(sample->data, cases[i].bytes, cases[i].size);
+    int result = th1520_normalize_h264_packet(sample);
+    expect((result == 0) == cases[i].valid, "framing validity classification");
+    if (cases[i].valid)
+      expect(sample->size == cases[i].size && !memcmp(sample->data, cases[i].bytes, sample->size),
+             "CABAC, escaped final zero and internal NAL bytes remain identical");
+    av_packet_free(&sample);
+  }
+  // Synthetic suffix framing checks, not a claim of complete slice validation.
+  AVPacket* sample = av_packet_alloc();
+  expect(sample && av_new_packet(sample, sizeof(escaped) + 1024) == 0, "allocate EPB tail case");
+  memcpy(sample->data, escaped, sizeof(escaped));
+  memset(sample->data + sizeof(escaped), 0, 1024);
+  expect(th1520_normalize_h264_packet(sample) == 0 && sample->size == (int)sizeof(escaped) + 1 &&
+         !memcmp(sample->data, escaped, sizeof(escaped)), "long tail preserves terminal 00 00 03 00");
+  av_packet_free(&sample);
+}
+
+static void test_packet_normalization(struct access_unit hd) {
+  setup_mock_sender(AV_CODEC_ID_H264, 1920, 1080, true);
+  uint8_t* input = av_mallocz((size_t)hd.size + 1024 + AV_INPUT_BUFFER_PADDING_SIZE);
+  expect(input != NULL, "allocate FEC padding test AU");
+  memcpy(input, hd.data, hd.size);
+  for (int zeros = 0; zeros <= 1024; zeros++) {
+    AVFrame* output = NULL;
+    int64_t pts = INT64_C(1000000) + zeros;
+    int result = ffmpeg_decode_frame_ex(input, hd.size + zeros, true, pts, &output);
+    int expected = canonical_h264_size(input, hd.size + zeros);
+    if (result != FFMPEG_DECODE_PACKET_ACCEPTED || output || captured_packet->size != expected ||
+        memcmp(captured_packet->data, input, expected) || !captured_padding_zero ||
+        captured_packet->flags != AV_PKT_FLAG_KEY || captured_packet->pts != pts ||
+        captured_packet->dts != AV_NOPTS_VALUE) {
+      fprintf(stderr, "FAIL: tail/meta preservation at %d FEC zero bytes\n", zeros);
+      exit(1);
+    }
+  }
+  expect(send_calls == 1025, "0..1024 FEC tail lengths normalize once and retain KEY/PTS/padding");
+  const uint8_t zero_au[] = {0,0,0,0,0,0,0,0};
+  const uint8_t invalid_au[] = {0,0,0,4,0x65,0x80,0x20,0x80};
+  AVFrame* invalid_output = NULL;
+  expect(ffmpeg_decode_frame_ex((unsigned char*)zero_au, sizeof(zero_au), true, 1, &invalid_output) == AVERROR_INVALIDDATA &&
+         !packet_pending && send_calls == 1025,
+         "all-zero AU is rejected without sending anything to OMX");
+  expect(ffmpeg_decode_frame_ex((unsigned char*)invalid_au, sizeof(invalid_au), true, 2, &invalid_output) == AVERROR_INVALIDDATA &&
+         !packet_pending && send_calls == 1025,
+         "non-Annex-B AU is rejected without sending anything to OMX");
+
+  // A valid SEI user_data_unregistered payload contains an escaped zero. The
+  // complete sender must preserve this internal NAL, not only the helper test.
+  const uint8_t sei[] = {0,0,1,6,5,16,0,0,3,0,1,2,3,4,5,6,7,8,9,10,11,12,13,0x80};
+  struct access_unit extended = append_bytes(hd, sei, sizeof(sei));
+  struct access_unit padded = append_bytes(extended, NULL, 512);
+  AVFrame* output = NULL;
+  expect(ffmpeg_decode_frame_ex(padded.data, padded.size, false, 2345678, &output) == FFMPEG_DECODE_PACKET_ACCEPTED &&
+         captured_packet->size == extended.size + 2 && !memcmp(captured_packet->data, extended.data, extended.size) &&
+         captured_packet->flags == 0 && captured_packet->pts == 2345678 && captured_padding_zero,
+         "actual sender preserves internal start codes and escaped SEI bytes");
+  av_free(input); av_free(extended.data); av_free(padded.data);
+}
+
+static void test_pending_metadata(struct access_unit hd, struct access_unit p) {
+  setup_mock_sender(AV_CODEC_ID_H264, 1920, 1080, true);
+  struct access_unit input = append_bytes(hd, NULL, 512);
+  AVFrame* output = NULL;
+  mock_send_result = AVERROR(EAGAIN);
+  expect(ffmpeg_decode_frame_ex(input.data, input.size, true, 987654321, &output) == FFMPEG_DECODE_PACKET_PENDING &&
+         packet_pending && send_calls == 1, "EAGAIN retains the original normalized packet");
+  uint8_t* owned_data = captured_packet->data;
+  int owned_size = captured_packet->size;
+  memset(input.data, 0xa5, input.size);
+  expect(ffmpeg_decode_frame_ex(p.data, p.size, false, 1, &output) == AVERROR(EAGAIN) && send_calls == 1,
+         "new input cannot replace a pending packet");
+  th1520_parser_error = AVERROR_INVALIDDATA;
+  mock_send_result = 0;
+  expect(ffmpeg_decode_frame_ex(NULL, 0, false, -123, &output) == FFMPEG_DECODE_PACKET_ACCEPTED &&
+         !packet_pending && send_calls == 2 && captured_packet->data == owned_data &&
+         captured_packet->size == owned_size && !memcmp(captured_packet->data, hd.data, hd.size) &&
+         captured_packet->flags == AV_PKT_FLAG_KEY && captured_packet->pts == 987654321 && captured_padding_zero,
+         "retry keeps owned bytes, KEY and PTS despite changed caller metadata and buffer");
+  expect(ffmpeg_decode_frame_ex(NULL, 0, true, 777, &output) == 0 && send_calls == 2,
+         "idle poll neither sends EOS nor changes captured metadata");
+  th1520_parser_error = 0;
+  mock_send_result = AVERROR(EAGAIN);
+  expect(ffmpeg_decode_frame_ex(p.data, p.size, false, 100, &output) == FFMPEG_DECODE_PACKET_PENDING,
+         "retain a non-key packet");
+  mock_send_result = 0;
+  expect(ffmpeg_decode_frame_ex(NULL, 0, true, 200, &output) == FFMPEG_DECODE_PACKET_ACCEPTED &&
+         captured_packet->flags == 0 && captured_packet->pts == 100,
+         "retry cannot add a key flag or replace the original PTS");
+  av_free(input.data);
+}
+
+static void test_legacy_and_other_codecs(struct access_unit hd, struct access_unit hevc) {
+  AVFrame* output = NULL;
+  setup_mock_sender(AV_CODEC_ID_H264, 1920, 1080, true);
+  mock_send_result = AVERROR(EAGAIN);
+  expect(ffmpeg_decode(hd.data, hd.size) == AVERROR(EAGAIN) && !packet_pending &&
+         captured_packet->flags == 0 && captured_packet->pts == AV_NOPTS_VALUE,
+         "legacy EAGAIN drops saved packet and retains legacy metadata defaults");
+  mock_send_result = 0;
+  expect(ffmpeg_decode_frame(hd.data, hd.size, &output) == FFMPEG_DECODE_PACKET_ACCEPTED &&
+         captured_packet->flags == 0 && captured_packet->pts == AV_NOPTS_VALUE,
+         "old decode_frame wrapper supplies false and unknown PTS");
+  expect(ffmpeg_decode_frame_ex(hd.data, hd.size, true, 1, NULL) == AVERROR(EINVAL),
+         "extended API rejects a NULL output pointer");
+
+  setup_mock_sender(AV_CODEC_ID_HEVC, 1280, 720, true);
+  struct access_unit padded = append_bytes(hevc, NULL, 512);
+  expect(ffmpeg_decode_frame_ex(padded.data, padded.size, true, 3456789, &output) == FFMPEG_DECODE_PACKET_ACCEPTED &&
+         captured_packet->size == padded.size && !memcmp(captured_packet->data, padded.data, padded.size) &&
+         captured_packet->flags == AV_PKT_FLAG_KEY && captured_packet->pts == 3456789,
+         "TH1520 HEVC bytes and tail are untouched while metadata is forwarded");
+  av_free(padded.data);
+
+  setup_mock_sender(AV_CODEC_ID_H264, 1920, 1080, false);
+  padded = append_bytes(hd, NULL, 512);
+  expect(ffmpeg_decode_frame(padded.data, padded.size, &output) == FFMPEG_DECODE_PACKET_ACCEPTED &&
+         captured_packet->size == padded.size && !memcmp(captured_packet->data, padded.data, padded.size) &&
+         captured_packet->flags == 0 && captured_packet->pts == AV_NOPTS_VALUE,
+         "non-TH1520 backend and legacy packet bytes are untouched");
+  av_free(padded.data);
+  ffmpeg_destroy();
+}
+
 static void test_semiplanar_conversion(void) {
   AVFrame* frame = av_frame_alloc();
   expect(frame != NULL, "allocate NV12 frame");
@@ -91,6 +281,8 @@ int main(int argc, char** argv) {
     fprintf(stderr, "Usage: %s 1920x1080.h264 1366x768.h264 1280x720.hevc\n", argv[0]);
     return 2;
   }
+  captured_packet = av_packet_alloc();
+  expect(captured_packet != NULL, "allocate sender capture");
   struct access_unit hd = load_au(argv[1], AV_CODEC_ID_H264, 0);
   struct access_unit p = load_au(argv[1], AV_CODEC_ID_H264, 1);
   struct access_unit padded = load_au(argv[2], AV_CODEC_ID_H264, 0);
@@ -111,23 +303,10 @@ int main(int argc, char** argv) {
   setup_guard(AV_CODEC_ID_HEVC, 1280, 720);
   expect(th1520_validate_size(hevc.data, hevc.size) == 0, "HEVC size validation");
 
-  setup_guard(AV_CODEC_ID_H264, 1920, 1080);
-  pkt = av_packet_alloc(); decoder_ctx = avcodec_alloc_context3(NULL);
-  expect(pkt && decoder_ctx, "allocate mocked sender");
-  mock_send_result = AVERROR(EAGAIN); send_calls = 0;
-  expect(send_packet(hd.data, hd.size) == AVERROR(EAGAIN) && packet_pending && send_calls == 1,
-         "EAGAIN retains the original validated packet");
-  th1520_parser_error = AVERROR_INVALIDDATA;
-  mock_send_result = 0;
-  expect(send_packet(NULL, 0) == 0 && !packet_pending && send_calls == 2,
-         "pending retry neither reparses nor replaces the packet");
-  expect(send_packet(NULL, 0) == 0 && send_calls == 2, "idle polling does not send EOS");
-
-  th1520_parser_error = 0;
-  mock_send_result = AVERROR(EAGAIN);
-  expect(ffmpeg_decode(hd.data, hd.size) == AVERROR(EAGAIN) && !packet_pending,
-         "legacy EAGAIN does not wedge all subsequent submissions");
-  ffmpeg_destroy();
+  test_tail_framing();
+  test_packet_normalization(hd);
+  test_pending_metadata(hd, p);
+  test_legacy_and_other_codecs(hd, hevc);
   test_semiplanar_conversion();
   expect(ffmpeg_init(VIDEO_FORMAT_AV1_MAIN8, 1920, 1080, TH1520_ACCELERATION, 2, 1) < 0,
          "AV1 rejected before opening hardware");
@@ -136,6 +315,7 @@ int main(int argc, char** argv) {
   expect(ffmpeg_init(VIDEO_FORMAT_H264_HIGH8_444, 1920, 1080, TH1520_ACCELERATION, 2, 1) < 0,
          "4:4:4 rejected before opening hardware");
   av_free(hd.data); av_free(p.data); av_free(padded.data); av_free(hevc.data);
+  av_packet_free(&captured_packet);
   puts("PASS: CPU-only TH1520 ownership/size checks");
   return 0;
 }
