@@ -244,6 +244,8 @@ static void pair_check(PSERVER_DATA server) {
 }
 
 int main(int argc, char* argv[]) {
+  // Preserve useful stdout/stderr ordering when diagnostics are piped to tee.
+  setvbuf(stdout, NULL, _IOLBF, 0);
   CONFIGURATION config;
   config_parse(argc, argv, &config);
 
