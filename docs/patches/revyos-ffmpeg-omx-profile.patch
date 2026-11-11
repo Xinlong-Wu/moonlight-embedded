@@ -1,0 +1,373 @@
+diff --git a/libavcodec/omxdecoder.c b/libavcodec/omxdecoder.c
+index 787e116..6460222 100644
+--- a/libavcodec/omxdecoder.c
++++ b/libavcodec/omxdecoder.c
+@@ -278,6 +278,30 @@ typedef struct outport_buffer_table {
+     uint8_t *vir_address;
+ } outport_buffer_table;
+ 
++// Diagnostic aggregates only. Except for retained-output refill (free_mutex)
++// and output allocation snapshots (output_mutex), these are decoder-thread
++// owned. The decoder's last reference runs cleanup after API/frame users exit.
++typedef struct OMXProfileTimer {
++    uint64_t calls;
++    uint64_t total_us;
++    uint64_t max_us;
++} OMXProfileTimer;
++
++enum OMXProfileStage {
++    OMX_PROF_RECEIVE,
++    OMX_PROF_INPUT_WAIT,
++    OMX_PROF_INPUT_COPY,
++    OMX_PROF_INPUT_EMPTY,
++    OMX_PROF_CONTROL_WAIT,
++    OMX_PROF_PORT_QUERY,
++    OMX_PROF_OUTPUT_WAIT,
++    OMX_PROF_FRAME_ALLOC,
++    OMX_PROF_FRAME_WRAP,
++    OMX_PROF_FETCH_PACKET,
++    OMX_PROF_REFILL,
++    OMX_PROF_COUNT
++};
++
+ typedef struct OMXCodecDecoderContext {
+     // const AVClass *class;
+     char *libname;
+@@ -386,8 +410,97 @@ typedef struct OMXCodecDecoderContext {
+     bool drm_prime_mode;
+ #endif
+     bool receive_frame_no_wait;
++
++    OMXProfileTimer profile_timers[OMX_PROF_COUNT];
++    uint64_t profile_loops, profile_loop_max, profile_pending_no_send;
++    uint64_t profile_input_bytes, profile_input_unavailable, profile_output_empty;
++    bool profile_window_seen;
++    int profile_pkt_min, profile_pkt_max, profile_pkt_last;
++    int profile_upper_min, profile_upper_max, profile_upper_last;
++    atomic_int profile_upper_snapshot;
++    int profile_init_in_min, profile_init_in_actual, profile_init_out_min, profile_init_out_actual;
++    int profile_init_upper, profile_in_allocated;
++    // Updated under output_mutex alongside the component's actual allocation.
++    int profile_out_allocated, profile_out_min, profile_out_actual;
++    uint64_t profile_output_reconfigs;
+ } OMXCodecDecoderContext;
+ 
++static inline void omx_profile_add(OMXCodecDecoderContext *s, enum OMXProfileStage stage, int64_t begin)
++{
++    int64_t elapsed = av_gettime_relative() - begin;
++    OMXProfileTimer *timer = &s->profile_timers[stage];
++    if (elapsed < 0)
++        elapsed = 0;
++    timer->calls++;
++    timer->total_us += elapsed;
++    if ((uint64_t)elapsed > timer->max_us)
++        timer->max_us = elapsed;
++}
++
++static inline void omx_profile_window(OMXCodecDecoderContext *s)
++{
++    int upper = atomic_load_explicit(&s->profile_upper_snapshot, memory_order_relaxed);
++    int packets = s->pkt_sent_num;
++    if (!s->profile_window_seen) {
++        s->profile_pkt_min = s->profile_pkt_max = packets;
++        s->profile_upper_min = s->profile_upper_max = upper;
++        s->profile_window_seen = true;
++    }
++    s->profile_pkt_min = FFMIN(s->profile_pkt_min, packets);
++    s->profile_pkt_max = FFMAX(s->profile_pkt_max, packets);
++    s->profile_upper_min = FFMIN(s->profile_upper_min, upper);
++    s->profile_upper_max = FFMAX(s->profile_upper_max, upper);
++    s->profile_pkt_last = packets;
++    s->profile_upper_last = upper;
++}
++
++static void omx_profile_report(OMXCodecDecoderContext *s)
++{
++    static const char *const names[OMX_PROF_COUNT] = {
++        "receive_total", "input_buffer_wait", "input_memcpy", "input_EmptyThisBuffer",
++        "buffer_control_wait", "port_GetParameter", "output_buffer_get",
++        "ff_get_buffer", "output_wrap", "ff_decode_get_packet", "retained_output_FillThisBuffer"
++    };
++    OMXProfileTimer timers[OMX_PROF_COUNT];
++    int out_allocated, out_min, out_actual;
++    uint64_t reconfigs;
++    unsigned i;
++    if (!s->profile_timers[OMX_PROF_RECEIVE].calls && !s->profile_init_in_actual)
++        return;
++    // FreeHandle has completed, and this is the final decoder reference. Keep
++    // the original per-path locks for snapshots too: no partially read refill
++    // timer or allocation metadata if a component callback is still unwinding.
++    if (s->mutex_cond_inited)
++        pthread_mutex_lock(&s->free_mutex);
++    memcpy(timers, s->profile_timers, sizeof(timers));
++    if (s->mutex_cond_inited)
++        pthread_mutex_unlock(&s->free_mutex);
++    if (s->mutex_cond_inited)
++        pthread_mutex_lock(&s->output_mutex);
++    out_allocated = s->profile_out_allocated;
++    out_min = s->profile_out_min;
++    out_actual = s->profile_out_actual;
++    reconfigs = s->profile_output_reconfigs;
++    if (s->mutex_cond_inited)
++        pthread_mutex_unlock(&s->output_mutex);
++    av_log(NULL, AV_LOG_INFO,
++           "OMX profile buffers: in_min=%d in_actual=%d in_allocated=%d out_init_min=%d out_init_actual=%d out_allocated=%d out_min=%d out_actual=%d upper_init=%d output_reconfigs=%"PRIu64"\n",
++           s->profile_init_in_min, s->profile_init_in_actual, s->profile_in_allocated,
++           s->profile_init_out_min, s->profile_init_out_actual, out_allocated, out_min, out_actual,
++           s->profile_init_upper, reconfigs);
++    av_log(NULL, AV_LOG_INFO,
++           "OMX profile loop: calls=%"PRIu64" loops=%"PRIu64" loops_max=%"PRIu64" pending_no_send=%"PRIu64" pkt_min=%d pkt_max=%d pkt_last=%d upper_min=%d upper_max=%d upper_last=%d input_bytes=%"PRIu64" input_unavailable=%"PRIu64" output_empty=%"PRIu64"\n",
++           timers[OMX_PROF_RECEIVE].calls, s->profile_loops, s->profile_loop_max, s->profile_pending_no_send,
++           s->profile_pkt_min, s->profile_pkt_max, s->profile_pkt_last,
++           s->profile_upper_min, s->profile_upper_max, s->profile_upper_last,
++           s->profile_input_bytes, s->profile_input_unavailable, s->profile_output_empty);
++    for (i = 0; i < OMX_PROF_COUNT; i++) {
++        OMXProfileTimer *t = &timers[i];
++        av_log(NULL, AV_LOG_INFO, "OMX profile stage=%s calls=%"PRIu64" total_us=%"PRIu64" avg_us=%.3f max_us=%"PRIu64"\n",
++               names[i], t->calls, t->total_us, t->calls ? (double)t->total_us / t->calls : 0.0, t->max_us);
++    }
++}
++
+ typedef struct {
+     const AVClass *class;
+     AVBufferRef *decoder_ref;
+@@ -723,6 +836,7 @@ static int OnOutputPortDisabled(OMXCodecDecoderContext *s)
+             s->handle, OMX_IndexParamPortDefinition, &out_port_params);
+ 
+         s->pkt_upper_bound = out_port_params.nBufferCountMin;
++        atomic_store_explicit(&s->profile_upper_snapshot, s->pkt_upper_bound, memory_order_relaxed);
+ 
+         pthread_mutex_lock(&s->output_mutex);
+         s->num_out_buffers = out_port_params.nBufferCountMin + 5;
+@@ -753,6 +867,10 @@ static int OnOutputPortDisabled(OMXCodecDecoderContext *s)
+         }
+ 
+         s->num_out_buffers = i;
++        s->profile_out_allocated = i;
++        s->profile_out_min = out_port_params.nBufferCountMin;
++        s->profile_out_actual = out_port_params.nBufferCountActual;
++        s->profile_output_reconfigs++;
+         s->num_done_out_buffers = 0;
+         for (i = 0; i < s->num_out_buffers && err == OMX_ErrorNone; i++) {
+             err = OMX_FillThisBuffer(s->handle, s->out_buffer_headers[i]);
+@@ -1340,9 +1458,12 @@ static int convertNV12toYUV420(AVCodecContext *avctx, AVFrame *avframe, OMX_BUFF
+ static int omx_try_fillbuffer(OMXCodecDecoderContext *s, OMX_BUFFERHEADERTYPE *buffer)
+ {
+     OMX_ERRORTYPE err;
++    int64_t begin;
+     pthread_mutex_lock(&s->free_mutex);
+     if (buffer->pAppPrivate && s->handle) {
++        begin = av_gettime_relative();
+         err = OMX_FillThisBuffer(s->handle, buffer);
++        omx_profile_add(s, OMX_PROF_REFILL, begin);
+         if (err != OMX_ErrorNone) {
+             append_buffer(&s->output_mutex, &s->output_cond, &s->num_done_out_buffers, s->done_out_buffers, buffer);
+             av_log(NULL, AV_LOG_ERROR, "OMX_FillThisBuffer failed: %x\n", err);
+@@ -1363,10 +1484,13 @@ static int check_buffer_outsize(AVCodecContext *avctx)
+     OMXDecoderContext *c = avctx->priv_data;
+     OMXCodecDecoderContext *s = (OMXCodecDecoderContext *)c->decoder_ref->data;
+     OMX_ERRORTYPE err;
++    int64_t begin;
+     OMX_PARAM_PORTDEFINITIONTYPE out_port_params = {0};
+     INIT_STRUCT(out_port_params);
+     out_port_params.nPortIndex = s->out_port;
++    begin = av_gettime_relative();
+     err = OMX_GetParameter(s->handle, OMX_IndexParamPortDefinition, &out_port_params);
++    omx_profile_add(s, OMX_PROF_PORT_QUERY, begin);
+     CHECK(err);
+     if (avctx->width != out_port_params.format.video.nFrameWidth ||
+         avctx->height != out_port_params.format.video.nFrameHeight) {
+@@ -1395,9 +1519,11 @@ static int ff_omx_dec_receive(AVCodecContext *avctx, OMXCodecDecoderContext *s,
+ {
+     OMX_ERRORTYPE err;
+     int ret;
++    int64_t begin = av_gettime_relative();
+     OMX_BUFFERHEADERTYPE *buffer = get_buffer(&s->output_mutex, &s->output_cond,
+                                    &s->num_done_out_buffers, &s->done_out_buffers,
+                                    -1);
++    omx_profile_add(s, OMX_PROF_OUTPUT_WAIT, begin);
+     if (!buffer) {
+         //omx_outputbuffer_thread  error
+         return AVERROR(EAGAIN);
+@@ -1413,6 +1539,7 @@ static int ff_omx_dec_receive(AVCodecContext *avctx, OMXCodecDecoderContext *s,
+     }
+ 
+     if (buffer->nFilledLen == 0) {
++        s->profile_output_empty++;
+         err = OMX_FillThisBuffer(s->handle, buffer);
+         if (err != OMX_ErrorNone) {
+             append_buffer(&s->output_mutex, &s->output_cond, &s->num_done_out_buffers, s->done_out_buffers, buffer);
+@@ -1432,7 +1559,9 @@ static int ff_omx_dec_receive(AVCodecContext *avctx, OMXCodecDecoderContext *s,
+ #ifdef FORMAT_NV12
+     avctx->pix_fmt = AV_PIX_FMT_NV12;
+ #endif
++    begin = av_gettime_relative();
+     ret = ff_get_buffer(avctx, avframe, AV_GET_BUFFER_FLAG_REF);
++    omx_profile_add(s, OMX_PROF_FRAME_ALLOC, begin);
+     if (ret < 0) {
+         av_log(avctx, AV_LOG_ERROR, "ff_get_buffer failed: %x\n", ret);
+         return ret;
+@@ -1448,11 +1577,13 @@ static int ff_omx_dec_receive(AVCodecContext *avctx, OMXCodecDecoderContext *s,
+         s->now_pts += s->pkt_duration;
+     }
+ 
++    begin = av_gettime_relative();
+ #ifdef FORMAT_NV12
+     ret = copyNV12toDst(avctx, avframe, buffer);
+ #else
+     ret = convertNV12toYUV420(avctx, avframe, buffer);
+ #endif
++    omx_profile_add(s, OMX_PROF_FRAME_WRAP, begin);
+     if (ret < 0) {
+         av_log(avctx, AV_LOG_ERROR, "Format output failed: %x\n", ret);
+         return ret;
+@@ -1601,6 +1732,12 @@ static av_cold int omx_component_init_decoder(AVCodecContext *avctx, const char
+     CHECK(err);
+ 
+     s->pkt_upper_bound = out_port_params.nBufferCountMin;
++    atomic_store_explicit(&s->profile_upper_snapshot, s->pkt_upper_bound, memory_order_relaxed);
++    s->profile_init_in_min = in_port_params.nBufferCountMin;
++    s->profile_init_in_actual = in_port_params.nBufferCountActual;
++    s->profile_init_out_min = out_port_params.nBufferCountMin;
++    s->profile_init_out_actual = out_port_params.nBufferCountActual;
++    s->profile_init_upper = s->pkt_upper_bound;
+     dump_portdef(s, &in_port_params);
+ 
+     INIT_STRUCT(formatIn);
+@@ -1687,6 +1824,7 @@ static av_cold int omx_component_init_decoder(AVCodecContext *avctx, const char
+ 
+     CHECK(err);
+     s->num_in_buffers = i;
++    s->profile_in_allocated = i;
+     for (i = 0; i < s->num_in_buffers; i++) {
+         s->free_in_buffers[i] = s->in_buffer_headers[i];
+     }
+@@ -1819,6 +1957,7 @@ static av_cold void omx_cleanup(OMXCodecDecoderContext *s)
+         av_freep(&s->done_out_buffers);
+ 
+     }
++    omx_profile_report(s);
+     if (s->mutex_cond_inited) {
+         pthread_cond_destroy(&s->state_cond);
+         pthread_mutex_destroy(&s->state_mutex);
+@@ -1867,6 +2006,7 @@ static av_cold int omx_decode_init(AVCodecContext *avctx)
+         return AVERROR(ENOMEM);
+     }
+ 
++    atomic_init(&s->profile_upper_snapshot, 0);
+     c->decoder_ref = av_buffer_create((uint8_t *)s, sizeof(*s), omx_release_decoder, NULL, AV_BUFFER_FLAG_READONLY);
+     if (!c->decoder_ref) {
+         av_log(NULL, AV_LOG_ERROR, "err av_buffer_create\n");
+@@ -1960,6 +2100,7 @@ static int ff_omx_dec_send(AVCodecContext *avctx, OMXCodecDecoderContext *s,
+     OMX_ERRORTYPE err;
+     int need_draining = 0;
+     int64_t timeout = 0;
++    int64_t begin;
+ 
+     if (wait) {
+         timeout = 80;
+@@ -1980,10 +2121,13 @@ static int ff_omx_dec_send(AVCodecContext *avctx, OMXCodecDecoderContext *s,
+     }
+ 
+     if (pkt->data) {
++        begin = av_gettime_relative();
+         buffer = get_buffer(&s->input_mutex, &s->input_cond,
+                             &s->num_free_in_buffers, &s->free_in_buffers, timeout);
++        omx_profile_add(s, OMX_PROF_INPUT_WAIT, begin);
+ 
+         if (buffer == NULL) {
++            s->profile_input_unavailable++;
+             return AVERROR(EAGAIN);
+         }
+ 
+@@ -2004,8 +2148,13 @@ static int ff_omx_dec_send(AVCodecContext *avctx, OMXCodecDecoderContext *s,
+ 
+         buffer->nOffset = 0;
+         buffer->nTimeStamp = to_omx_ticks(av_rescale_q(pkt->pts, avctx->time_base, AV_TIME_BASE_Q));
++        begin = av_gettime_relative();
+         memcpy(buffer->pBuffer, pkt->data, pkt->size);
++        omx_profile_add(s, OMX_PROF_INPUT_COPY, begin);
++        s->profile_input_bytes += pkt->size;
++        begin = av_gettime_relative();
+         err = OMX_EmptyThisBuffer(s->handle, buffer);
++        omx_profile_add(s, OMX_PROF_INPUT_EMPTY, begin);
+         if (err != OMX_ErrorNone) {
+             append_buffer(&s->input_mutex, &s->input_cond, &s->num_free_in_buffers, s->free_in_buffers, buffer);
+             av_log(avctx, AV_LOG_ERROR, "OMX_EmptyThisBuffer failed: %x\n", err);
+@@ -2015,13 +2164,17 @@ static int ff_omx_dec_send(AVCodecContext *avctx, OMXCodecDecoderContext *s,
+     } else if (!s->eos_sent) {
+         //flush, end of stream
+         //ff_omx_dec_send reach eos
++        begin = av_gettime_relative();
+         buffer = get_buffer(&s->input_mutex, &s->input_cond,
+                             &s->num_free_in_buffers, &s->free_in_buffers, timeout);
++        omx_profile_add(s, OMX_PROF_INPUT_WAIT, begin);
+ 
+         buffer->nFilledLen = 0;
+         buffer->nFlags = OMX_BUFFERFLAG_EOS;
+         buffer->pAppPrivate = buffer->pOutputPortPrivate = NULL;
++        begin = av_gettime_relative();
+         err = OMX_EmptyThisBuffer(s->handle, buffer);
++        omx_profile_add(s, OMX_PROF_INPUT_EMPTY, begin);
+         if (err != OMX_ErrorNone) {
+             append_buffer(&s->input_mutex, &s->input_cond, &s->num_free_in_buffers, s->free_in_buffers, buffer);
+             av_log(avctx, AV_LOG_ERROR, "OMX_EmptyThisBuffer failed: %x\n", err);
+@@ -2102,12 +2255,20 @@ static int omx_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+     OMXDecoderContext *c = avctx->priv_data;
+     OMXCodecDecoderContext *s = (OMXCodecDecoderContext *)c->decoder_ref->data;
+     int ret;
++    int64_t receive_begin = av_gettime_relative();
++    int64_t begin;
++    uint64_t loops = 0;
+     s->got_frame = false;
+     /* feed decoder */
+     while (1) {
++        loops++;
++        s->profile_loops++;
++        omx_profile_window(s);
+         /* fetch new packet or eof */
+         if (s->pkt_full == 0 && !s->eos_reach) {
++            begin = av_gettime_relative();
+             ret = ff_decode_get_packet(avctx, &s->buffered_pkt);
++            omx_profile_add(s, OMX_PROF_FETCH_PACKET, begin);
+             if (ret == AVERROR_EOF) {
+                 s->need_sendeos = 1;
+                 s->eos_reach = 1;
+@@ -2142,9 +2303,11 @@ static int omx_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+         }
+ 
+         if (s->num_free_in_buffers == 0 && s->num_done_out_buffers == 0 && !s->flushing && !s->eos_sent && !s->receive_frame_no_wait) {
++            begin = av_gettime_relative();
+             pthread_mutex_lock(&s->buffer_control_mutex);
+             pthread_cond_wait(&s->buffer_control_cond, &s->buffer_control_mutex);
+             pthread_mutex_unlock(&s->buffer_control_mutex);
++            omx_profile_add(s, OMX_PROF_CONTROL_WAIT, begin);
+         }
+ 
+         ret = check_buffer_outsize(avctx);
+@@ -2168,10 +2331,14 @@ static int omx_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+             /* poll for space again */
+             continue;
+         }
++        if (s->buffered_pkt.size > 0)
++            s->profile_pending_no_send++;
+ 
+         /* fetch new packet or eof */
+         if (s->pkt_full == 0 && !s->eos_reach) {
++            begin = av_gettime_relative();
+             ret = ff_decode_get_packet(avctx, &s->buffered_pkt);
++            omx_profile_add(s, OMX_PROF_FETCH_PACKET, begin);
+             if (ret == AVERROR_EOF) {
+                 s->need_sendeos = 1;
+                 s->eos_reach = 1;
+@@ -2187,6 +2354,10 @@ static int omx_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+     }
+     ret = AVERROR(EAGAIN);
+ end:
++    if (loops > s->profile_loop_max)
++        s->profile_loop_max = loops;
++    omx_profile_window(s);
++    omx_profile_add(s, OMX_PROF_RECEIVE, receive_begin);
+     if (s->got_frame)
+         return 0;
+     s->receive_frame_no_wait = false;
