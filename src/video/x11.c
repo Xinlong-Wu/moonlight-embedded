@@ -11,6 +11,7 @@
  * See <http://www.gnu.org/licenses/> for a copy of the license.
  */
 
+#define _POSIX_C_SOURCE 200809L
 #include "video.h"
 #include "egl.h"
 #include "ffmpeg.h"
@@ -30,6 +31,8 @@
 #include <poll.h>
 #include <errno.h>
 #include <pthread.h>
+#include <time.h>
+#include <inttypes.h>
 
 #define X11_VDPAU_ACCELERATION ENABLE_HARDWARE_ACCELERATION_1
 #define X11_VAAPI_ACCELERATION ENABLE_HARDWARE_ACCELERATION_2
@@ -50,12 +53,40 @@ static bool egl_initialized, input_initialized, stopping;
 static AVFrame* queued_frame;
 static unsigned long decoded_frames, presented_frames, replaced_frames;
 static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+// Only submission and actual decoder reinitialization use this lock. Normal
+// presentation must never wait behind a vendor OMX send/receive operation.
 static pthread_mutex_t decoder_mutex = PTHREAD_MUTEX_INITIALIZER;
+// Short control-state operations only: no FFmpeg, EGL or frame-unref calls.
+static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t submit_calls, submit_total_us, submit_max_us, queue_max_us;
+static uint64_t render_calls, render_total_us, render_max_us;
 
 #ifdef HAVE_TH1520
 static bool th1520_active, force_nv12, require_drm, reset_requested, await_idr, fatal_error;
+static bool last_frame_valid;
+static bool trace_input;
+static uint32_t last_frame_number;
+static unsigned long input_gaps, input_idrs;
 static int video_format, video_width, video_height;
 #endif
+
+static uint64_t monotonic_us(void) {
+  struct timespec now;
+  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+  return (uint64_t)now.tv_sec * 1000000 + now.tv_nsec / 1000;
+}
+
+// 0 = ready, 1 = stopping, -1 = waiting for a renderer-side restart/failure.
+static int submission_state(void) {
+  int result = 0;
+  pthread_mutex_lock(&state_mutex);
+  if (stopping) result = 1;
+#ifdef HAVE_TH1520
+  else if (th1520_active && (fatal_error || reset_requested)) result = -1;
+#endif
+  pthread_mutex_unlock(&state_mutex);
+  return result;
+}
 
 static void notify_renderer(void) {
   const char token = 1;
@@ -96,25 +127,66 @@ static void queue_frame(AVFrame* frame, uint8_t colorspace) {
 }
 
 #ifdef HAVE_TH1520
-// Called on the rendering thread with decoder_mutex held. All external OMX
-// references must be returned before creating another OMX component.
+static int next_nal(const unsigned char* data, int length, int start, int* prefix) {
+  for (int i = start; i + 3 < length; i++) {
+    if (data[i] || data[i + 1]) continue;
+    if (data[i + 2] == 1) { *prefix = 3; return i; }
+    if (!data[i + 2] && data[i + 3] == 1) { *prefix = 4; return i; }
+  }
+  return length;
+}
+
+static void trace_h264_input(const unsigned char* data, int length, int number) {
+  // Types and lengths only: no compressed picture bytes or desktop images.
+  char summary[768];
+  int used = snprintf(summary, sizeof(summary), "TH1520 NAL summary frame=%d bytes=%d:", number, length);
+  int prefix = 0, position = next_nal(data, length, 0, &prefix);
+  int count = 0;
+  while (position < length && count++ < 24 && used < (int)sizeof(summary) - 40) {
+    int header = position + prefix, next_prefix = 0;
+    if (header >= length) break;
+    int next = next_nal(data, length, header + 1, &next_prefix);
+    used += snprintf(summary + used, sizeof(summary) - used, " type=%u/len=%d", data[header] & 31, next - position);
+    position = next; prefix = next_prefix;
+  }
+  fprintf(stderr, "%s\n", summary);
+}
+
+static void request_decoder_reset(bool fatal) {
+  pthread_mutex_lock(&state_mutex);
+  if (fatal) fatal_error = true;
+  else reset_requested = true;
+  pthread_mutex_unlock(&state_mutex);
+  notify_renderer();
+}
+
+// Rendering thread only. The restart flag prevents new submissions while an
+// existing vendor call finishes. Retire GPU-held output before waiting for
+// decoder exclusivity, then drop the final mailbox frame with that exclusivity.
 static int reset_decoder(void) {
-  AVFrame* queued = take_frame();
-  av_frame_free(&queued);
   if (egl_release_frame() < 0) {
     fprintf(stderr, "TH1520: cannot retire GPU frame; refusing decoder restart\n");
-    fatal_error = true;
+    request_decoder_reset(true);
     return -1;
   }
+  pthread_mutex_lock(&decoder_mutex);
+  pthread_mutex_lock(&state_mutex);
+  bool stop = stopping;
+  pthread_mutex_unlock(&state_mutex);
+  if (stop) { pthread_mutex_unlock(&decoder_mutex); return -1; }
+  AVFrame* queued = take_frame();
+  av_frame_free(&queued);
+  int result = ffmpeg_init(video_format, video_width, video_height,
+                           TH1520_ACCELERATION | (force_nv12 ? TH1520_NV12 : 0), 2, 1);
+  last_frame_valid = false;
+  pthread_mutex_lock(&state_mutex);
   reset_requested = false;
   await_idr = true;
-  if (ffmpeg_init(video_format, video_width, video_height,
-                  TH1520_ACCELERATION | (force_nv12 ? TH1520_NV12 : 0), 2, 1) < 0) {
-    fprintf(stderr, "TH1520: decoder restart failed (no software fallback)\n");
-    fatal_error = true;
-    return -1;
-  }
-  return 0;
+  if (result < 0) fatal_error = true;
+  pthread_mutex_unlock(&state_mutex);
+  pthread_mutex_unlock(&decoder_mutex);
+  if (result < 0) fprintf(stderr, "TH1520: decoder restart failed (no software fallback)\n");
+  return result;
 }
 #endif
 
@@ -122,40 +194,40 @@ static int frame_handle(int fd) {
   char tokens[128];
   while (read(fd, tokens, sizeof(tokens)) > 0) {}
 #ifdef HAVE_TH1520
-  pthread_mutex_lock(&decoder_mutex);
-  if (th1520_active && fatal_error) {
-    pthread_mutex_unlock(&decoder_mutex);
-    return LOOP_RETURN;
-  }
-  if (th1520_active && reset_requested) {
-    int result = reset_decoder();
-    pthread_mutex_unlock(&decoder_mutex);
-    return result < 0 ? LOOP_RETURN : LOOP_OK;
-  }
-  pthread_mutex_unlock(&decoder_mutex);
+  pthread_mutex_lock(&state_mutex);
+  bool fatal = th1520_active && fatal_error;
+  bool reset = th1520_active && reset_requested;
+  bool stop = stopping;
+  pthread_mutex_unlock(&state_mutex);
+  if (fatal || stop) return LOOP_RETURN;
+  if (reset) return reset_decoder() < 0 ? LOOP_RETURN : LOOP_OK;
 #endif
   AVFrame* frame = take_frame();
   if (!frame) return LOOP_OK;
 #ifdef HAVE_TH1520
   int result = 0;
   if (th1520_active) {
+    uint64_t begin = monotonic_us();
     if (frame->format == AV_PIX_FMT_DRM_PRIME) result = egl_draw_drm_prime(frame);
     else if (frame->format == AV_PIX_FMT_NV12) result = egl_draw_nv12(frame);
     else result = -1;
+    uint64_t elapsed = monotonic_us() - begin;
+    render_calls++; render_total_us += elapsed;
+    if (elapsed > render_max_us) render_max_us = elapsed;
+    if (elapsed >= 50000)
+      fprintf(stderr, "TH1520 slow render: pts_us=%" PRId64 " elapsed_ms=%.3f\n", frame->pts, elapsed / 1000.0);
     if (result == 0) presented_frames++;
     av_frame_free(&frame);
     if (result < 0) {
-      pthread_mutex_lock(&decoder_mutex);
       if (!force_nv12 && !require_drm) {
         fprintf(stderr, "TH1520: dma-buf rendering failed, restarting OMX with NV12 output\n");
         force_nv12 = true;
-        reset_requested = true;
+        request_decoder_reset(false);
         result = reset_decoder();
       } else {
         fprintf(stderr, "TH1520: rendering failed in forced %s output mode\n", require_drm ? "DRM PRIME" : "NV12");
-        fatal_error = true;
+        request_decoder_reset(true);
       }
-      pthread_mutex_unlock(&decoder_mutex);
     }
     return result < 0 ? LOOP_RETURN : LOOP_OK;
   }
@@ -187,10 +259,15 @@ static int x11_setup(int videoFormat, int width, int height, int redrawRate, voi
   }
   stopping = false;
   decoded_frames = presented_frames = replaced_frames = 0;
+  submit_calls = submit_total_us = submit_max_us = queue_max_us = 0;
+  render_calls = render_total_us = render_max_us = 0;
   int avc_flags = SLICE_THREADING;
 #ifdef HAVE_TH1520
   th1520_active = (drFlags & X11_TH1520_ACCELERATION) != 0;
   force_nv12 = reset_requested = await_idr = fatal_error = false;
+  last_frame_valid = false;
+  input_gaps = input_idrs = 0;
+  trace_input = getenv("MOONLIGHT_TH1520_TRACE") != NULL;
   video_format = videoFormat; video_width = width; video_height = height;
   if (th1520_active) {
     const char* mode = getenv("MOONLIGHT_TH1520_OUTPUT");
@@ -201,6 +278,8 @@ static int x11_setup(int videoFormat, int width, int height, int redrawRate, voi
     require_drm = mode && !strcmp(mode, "drm");
     force_nv12 = mode && !strcmp(mode, "nv12");
     avc_flags = TH1520_ACCELERATION | (force_nv12 ? TH1520_NV12 : 0);
+    printf("TH1520 pipeline: render_control=independent h264_tail=%s packet_metadata=key+pts\n",
+           videoFormat == VIDEO_FORMAT_H264 ? "max-two-zero" : "unchanged");
   } else
 #endif
   if (drFlags & X11_VDPAU_ACCELERATION) avc_flags = VDPAU_ACCELERATION;
@@ -279,12 +358,14 @@ static int x11_setup_th1520(int format, int width, int height, int rate, void* c
 #endif
 
 static void x11_stop(void) {
-  pthread_mutex_lock(&decoder_mutex);
+  pthread_mutex_lock(&state_mutex);
   stopping = true;
-  pthread_mutex_unlock(&decoder_mutex);
+  pthread_mutex_unlock(&state_mutex);
 }
 
 void x11_cleanup(void) {
+  x11_stop();
+  pthread_mutex_lock(&decoder_mutex);
   AVFrame* frame = take_frame();
   av_frame_free(&frame);
   // Release GPU references while the old decoder is still alive.
@@ -301,63 +382,93 @@ void x11_cleanup(void) {
   }
   free(ffmpeg_buffer); ffmpeg_buffer = NULL; ffmpeg_buffer_size = 0;
 #ifdef HAVE_TH1520
-  if (th1520_active)
+  if (th1520_active) {
     printf("TH1520 frames: decoded=%lu presented=%lu replaced=%lu\n", decoded_frames, presented_frames, replaced_frames);
+    printf("TH1520 timing: submit_avg_ms=%.3f submit_max_ms=%.3f queue_max_ms=%.3f render_avg_ms=%.3f render_max_ms=%.3f input_gaps=%lu input_idrs=%lu\n",
+           submit_calls ? submit_total_us / (1000.0 * submit_calls) : 0.0, submit_max_us / 1000.0, queue_max_us / 1000.0,
+           render_calls ? render_total_us / (1000.0 * render_calls) : 0.0, render_max_us / 1000.0, input_gaps, input_idrs);
+  }
   th1520_active = false;
 #endif
+  pthread_mutex_unlock(&decoder_mutex);
 }
 
 #ifdef HAVE_TH1520
 static int th1520_submit(PDECODE_UNIT unit) {
-  if (fatal_error || reset_requested) return DR_NEED_IDR;
-  if (await_idr) {
-    if (unit->frameType != FRAME_TYPE_IDR) return DR_NEED_IDR;
-    await_idr = false;
+  bool key = unit->frameType == FRAME_TYPE_IDR;
+  pthread_mutex_lock(&state_mutex);
+  bool waiting = await_idr;
+  if (waiting && key) await_idr = false;
+  pthread_mutex_unlock(&state_mutex);
+  if (waiting && !key) return DR_NEED_IDR;
+
+  uint32_t number = (uint32_t)unit->frameNumber;
+  if (last_frame_valid && number != last_frame_number + 1) {
+    input_gaps++;
+    fprintf(stderr, "TH1520 input gap: previous=%" PRIu32 " current=%" PRIu32 " type=%s\n",
+            last_frame_number, number, key ? "IDR" : "P");
+    // Core queue overflow normally resumes at IDR. A P-frame gap is not safe
+    // for this backend (no reference invalidation): don't feed missing refs.
+    if (!key) { request_decoder_reset(false); return DR_NEED_IDR; }
   }
   unsigned char* data = ffmpeg_buffer;
   int length = unit->fullLength;
+  if (trace_input && video_format == VIDEO_FORMAT_H264 && submit_calls < 5)
+    trace_h264_input(data, length, unit->frameNumber);
+  int64_t pts = unit->presentationTimeUs <= INT64_MAX ? (int64_t)unit->presentationTimeUs : AV_NOPTS_VALUE;
   for (int step = 0; step < MAX_DECODE_STEPS; step++) {
+    int control = submission_state();
+    if (control != 0) return control > 0 ? DR_OK : DR_NEED_IDR;
     AVFrame* frame = NULL;
-    int status = ffmpeg_decode_frame(data, length, &frame);
+    int status = ffmpeg_decode_frame_ex(data, length, key, pts, &frame);
     if (frame) {
       queue_frame(frame, unit->colorspace);
       av_frame_unref(frame); // Return the borrowed ring reference immediately.
     }
     if (status == AVERROR_INPUT_CHANGED) {
       fprintf(stderr, "TH1520: host changed video dimensions; restart streaming at the new resolution\n");
-      fatal_error = true;
-      notify_renderer();
+      request_decoder_reset(true);
       return DR_NEED_IDR;
     }
     if (status < 0) break;
-    data = NULL; length = 0;
-    if (!(status & (FFMPEG_DECODE_PACKET_PENDING | FFMPEG_DECODE_FRAME_AVAILABLE))) return DR_OK;
+    data = NULL; length = 0; key = false; pts = AV_NOPTS_VALUE;
+    if (!(status & (FFMPEG_DECODE_PACKET_PENDING | FFMPEG_DECODE_FRAME_AVAILABLE))) {
+      last_frame_valid = true;
+      last_frame_number = number;
+      if (unit->frameType == FRAME_TYPE_IDR) input_idrs++;
+      return DR_OK;
+    }
   }
   // A bounded pump must never return DR_OK while silently skipping the next AU.
-  // Restart on the UI thread after returning all mailbox/GPU references.
-  fprintf(stderr, "TH1520: decoder error/backpressure, restarting and requesting IDR\n");
-  reset_requested = true;
-  notify_renderer();
+  fprintf(stderr, "TH1520: decoder error/backpressure at frame %" PRIu32 ", requesting restart and IDR\n", number);
+  request_decoder_reset(false);
   return DR_NEED_IDR;
 }
 #endif
 
 int x11_submit_decode_unit(PDECODE_UNIT unit) {
   if (!unit || unit->fullLength <= 0) return DR_NEED_IDR;
+  int control = submission_state();
+  if (control != 0) return control > 0 ? DR_OK : DR_NEED_IDR;
+  uint64_t begin = monotonic_us();
+  // DU enqueue time uses moonlight-common's process-relative clock, not the
+  // absolute CLOCK_MONOTONIC value used for local duration measurements.
+  uint64_t common_now = unit->enqueueTimeUs ? LiGetMicroseconds() : 0;
+  uint64_t queue_age = unit->enqueueTimeUs && common_now >= unit->enqueueTimeUs ? common_now - unit->enqueueTimeUs : 0;
   pthread_mutex_lock(&decoder_mutex);
-  if (stopping) { pthread_mutex_unlock(&decoder_mutex); return DR_OK; }
+  control = submission_state();
+  if (control != 0) { pthread_mutex_unlock(&decoder_mutex); return control > 0 ? DR_OK : DR_NEED_IDR; }
+  int result = DR_NEED_IDR;
   ensure_buf_size(&ffmpeg_buffer, &ffmpeg_buffer_size, (size_t)unit->fullLength + AV_INPUT_BUFFER_PADDING_SIZE);
   int length = 0;
   for (PLENTRY entry = unit->bufferList; entry; entry = entry->next) {
-    if (entry->length < 0 || entry->length > unit->fullLength - length || !entry->data) {
-      pthread_mutex_unlock(&decoder_mutex); return DR_NEED_IDR;
-    }
+    if (entry->length < 0 || entry->length > unit->fullLength - length || !entry->data) goto finished;
     memcpy((unsigned char*)ffmpeg_buffer + length, entry->data, entry->length);
     length += entry->length;
   }
-  if (length != unit->fullLength) { pthread_mutex_unlock(&decoder_mutex); return DR_NEED_IDR; }
+  if (length != unit->fullLength) goto finished;
   memset((unsigned char*)ffmpeg_buffer + length, 0, AV_INPUT_BUFFER_PADDING_SIZE);
-  int result = DR_OK;
+  result = DR_OK;
 #ifdef HAVE_TH1520
   if (th1520_active) result = th1520_submit(unit);
   else
@@ -366,6 +477,19 @@ int x11_submit_decode_unit(PDECODE_UNIT unit) {
     if (ffmpeg_decode(ffmpeg_buffer, length) < 0) result = DR_NEED_IDR;
     AVFrame* frame = ffmpeg_get_frame(true);
     if (frame) queue_frame(frame, unit->colorspace);
+  }
+finished:
+  {
+    uint64_t end = monotonic_us();
+    uint64_t elapsed = end >= begin ? end - begin : 0;
+    submit_calls++; submit_total_us += elapsed;
+    if (elapsed > submit_max_us) submit_max_us = elapsed;
+    if (queue_age > queue_max_us) queue_max_us = queue_age;
+#ifdef HAVE_TH1520
+    if (th1520_active && (elapsed >= 50000 || queue_age >= 100000))
+      fprintf(stderr, "TH1520 slow submit: frame=%d type=%s bytes=%d elapsed_ms=%.3f queue_ms=%.3f\n",
+              unit->frameNumber, unit->frameType == FRAME_TYPE_IDR ? "IDR" : "P", length, elapsed / 1000.0, queue_age / 1000.0);
+#endif
   }
   pthread_mutex_unlock(&decoder_mutex);
   return result;
